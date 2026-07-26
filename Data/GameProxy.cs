@@ -1,14 +1,10 @@
-﻿using System;
-using System.Collections;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.IO;
-using System.Linq;
-using System.Reflection;
-using System.Text;
-using Castle.DynamicProxy;
+﻿using Castle.DynamicProxy;
 using ReflectionMagic;
 using SpaceEditor.Rocks;
+using System.Diagnostics;
+using System.IO;
+using System.Reflection;
+using System.Text;
 
 namespace SpaceEditor.Data;
 
@@ -33,7 +29,7 @@ public class InputActions
     public InputActionInfo? TryGetInputActionInfo(object inputActionDefinitionStub)
     {
         var id = inputActionDefinitionStub.AsDynamic().Guid;
-        return TryGetInputActionInfo((Guid) id);
+        return TryGetInputActionInfo((Guid)id);
     }
 }
 
@@ -98,7 +94,7 @@ public class GameProxy
     public string BinsPath { get; }
 
     public Assembly MainAssembly { get; }
-    
+
     public AsyncLazy<InputIds> InputIds { get; }
     public AsyncLazy<InputActions> InputActions { get; }
 
@@ -111,10 +107,10 @@ public class GameProxy
         var se2 = ReflectionRocks.GetLib(this.BinsPath, GameFacts.MainDll);
         this.MainAssembly = se2;
 
-        var st =  FindType("Keen.VRage.Library.Utils.Singleton");
+        var st = FindType("Keen.VRage.Library.Utils.Singleton");
         var mdt = FindType("Keen.VRage.Library.Reflection.MetadataManager");
         var md = st.AsDynamicType().GetInstance(mdt);
-        md.PushContext(new[]{se2});
+        md.PushContext(new[] { se2 });
 
         this.InputIds = new(LoadInputIds);
         this.InputActions = new(LoadInputActions);
@@ -139,7 +135,7 @@ public class GameProxy
 
         var format = Enum.Parse(FindType("SerializerFormat"), "Json");
 
-        using var sc = (IDisposable) Activator.CreateInstance(FindType("SerializationContext"), content, "NoName.txt", typedServices)!;
+        using var sc = (IDisposable)Activator.CreateInstance(FindType("SerializationContext"), content, "NoName.txt", typedServices)!;
         return FindType("SerializationHelper").AsDynamicType().DeserializeAbstract<object>(sc, format);
     }
 
@@ -151,7 +147,7 @@ public class GameProxy
         var format = Enum.Parse(FindType("SerializerFormat"), "Json");
 
         using var data = new MemoryStream();
-        using var sc = (IDisposable) Activator.CreateInstance(FindType("SerializationContext"), data, "NoName.txt", typedServices)!;
+        using var sc = (IDisposable)Activator.CreateInstance(FindType("SerializationContext"), data, "NoName.txt", typedServices)!;
         FindType("SerializationHelper").GetMethod("SerializeAbstract")!.MakeGenericMethod(typeof(object)).Invoke(null, [sc, instance, format]);
 
         return Encoding.UTF8.GetString(data.GetBuffer().AsSpan()[..(int)data.Length]);
@@ -257,11 +253,11 @@ public class GameProxy
 
             if (methodName == "TryLocateDefinition" && invocation.Arguments.Length == 3)
             {
-                var id = (Guid) invocation.Arguments[0]!;
-                var type = (Type) invocation.Arguments[1]!;
+                var id = (Guid)invocation.Arguments[0]!;
+                var type = (Type)invocation.Arguments[1]!;
                 invocation.Arguments[2] = this.Actions.TryGetInputActionInfo(id)?.DefinitionInstanceStub ??
                                           DefinitionRocks.AllocateDefinitionStub(type, id);
-                
+
                 invocation.ReturnValue = true;
             }
             else
