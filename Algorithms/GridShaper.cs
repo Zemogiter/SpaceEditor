@@ -93,6 +93,7 @@ public class GridShaper
         // Initialize ILGPU Context
         using var context = Context.CreateDefault();
         using var accelerator = context.GetPreferredDevice(preferCPU: false).CreateAccelerator(context);
+        System.Diagnostics.Debug.WriteLine($"\n[ILGPU VERIFICATION] Executing on: {accelerator.Name} (Type: {accelerator.AcceleratorType})\n");
 
         // Prepare Triangle Data
         int triangleCount = this.Mesh.TriangleCount;
@@ -673,10 +674,9 @@ public class GridShaper
         }
     }
 
-
 public static class VoxelizationKernel
 {
-    // GPU-safe math implementations must reside inside this class
+    // GPU-safe math implementations
     private static int Min(int a, int b) => a < b ? a : b;
     private static int Max(int a, int b) => a > b ? a : b;
     private static float Min(float a, float b) => a < b ? a : b;
@@ -707,6 +707,15 @@ public static class VoxelizationKernel
         int maxY = Min(gridY - 1, Ceiling((tri.MaxBounds.Y - gridOrigin.Y) / cellSize));
         int maxZ = Min(gridZ - 1, Ceiling((tri.MaxBounds.Z - gridOrigin.Z) / cellSize));
 
+        // OPTIMIZATION 1: Precompute triangle edges and normal outside the loop
+        float e0X = tri.V1.X - tri.V0.X; float e0Y = tri.V1.Y - tri.V0.Y; float e0Z = tri.V1.Z - tri.V0.Z;
+        float e1X = tri.V2.X - tri.V1.X; float e1Y = tri.V2.Y - tri.V1.Y; float e1Z = tri.V2.Z - tri.V1.Z;
+        float e2X = tri.V0.X - tri.V2.X; float e2Y = tri.V0.Y - tri.V2.Y; float e2Z = tri.V0.Z - tri.V2.Z;
+
+        float normalX = e0Y * e1Z - e0Z * e1Y;
+        float normalY = e0Z * e1X - e0X * e1Z;
+        float normalZ = e0X * e1Y - e0Y * e1X;
+
         for (int z = minZ; z <= maxZ; z++)
         {
             for (int y = minY; y <= maxY; y++)
@@ -719,17 +728,29 @@ public static class VoxelizationKernel
                         gridOrigin.Z + (z + 0.5f) * cellSize
                     );
 
-                    if (CheckTriangleBoxIntersection(tri, cellCenter, cellSize))
+                    // Pass precomputed values into the intersection test
+                    if (CheckTriangleBoxIntersection(tri, cellCenter, cellSize,
+                        e0X, e0Y, e0Z, e1X, e1Y, e1Z, e2X, e2Y, e2Z, normalX, normalY, normalZ))
                     {
                         int flatIndex = x + (y * gridX) + (z * gridX * gridY);
-                        Atomic.Exchange(ref voxelGrid[flatIndex], 0);
+
+                        // OPTIMIZATION 2: Cache-friendly early exit prevents memory bus locking
+                        if (voxelGrid[flatIndex] != 0)
+                        {
+                            Atomic.Exchange(ref voxelGrid[flatIndex], 0);
+                        }
                     }
                 }
             }
         }
     }
 
-    private static bool CheckTriangleBoxIntersection(GpuTriangle tri, Float3 boxCenter, float cellSize)
+    private static bool CheckTriangleBoxIntersection(
+        GpuTriangle tri, Float3 boxCenter, float cellSize,
+        float e0X, float e0Y, float e0Z,
+        float e1X, float e1Y, float e1Z,
+        float e2X, float e2Y, float e2Z,
+        float normalX, float normalY, float normalZ)
     {
         float boxHalf = cellSize * 0.5f;
 
@@ -738,21 +759,12 @@ public static class VoxelizationKernel
         float v1X = tri.V1.X - boxCenter.X; float v1Y = tri.V1.Y - boxCenter.Y; float v1Z = tri.V1.Z - boxCenter.Z;
         float v2X = tri.V2.X - boxCenter.X; float v2Y = tri.V2.Y - boxCenter.Y; float v2Z = tri.V2.Z - boxCenter.Z;
 
-        // Compute edge vectors
-        float e0X = v1X - v0X; float e0Y = v1Y - v0Y; float e0Z = v1Z - v0Z;
-        float e1X = v2X - v1X; float e1Y = v2Y - v1Y; float e1Z = v2Z - v1Z;
-        float e2X = v0X - v2X; float e2Y = v0Y - v2Y; float e2Z = v0Z - v2Z;
-
         // SAT Test 1: Box AABB bounds
         if (Min3(v0X, v1X, v2X) > boxHalf || Max3(v0X, v1X, v2X) < -boxHalf) return false;
         if (Min3(v0Y, v1Y, v2Y) > boxHalf || Max3(v0Y, v1Y, v2Y) < -boxHalf) return false;
         if (Min3(v0Z, v1Z, v2Z) > boxHalf || Max3(v0Z, v1Z, v2Z) < -boxHalf) return false;
 
         // SAT Test 2: Triangle Plane vs Box Overlap
-        float normalX = e0Y * e1Z - e0Z * e1Y;
-        float normalY = e0Z * e1X - e0X * e1Z;
-        float normalZ = e0X * e1Y - e0Y * e1X;
-
         float d = -(normalX * v0X + normalY * v0Y + normalZ * v0Z);
 
         float vminX = normalX > 0f ? -boxHalf : boxHalf; float vmaxX = normalX > 0f ? boxHalf : -boxHalf;
