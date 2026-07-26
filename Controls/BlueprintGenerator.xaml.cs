@@ -4,10 +4,7 @@ using Microsoft.Win32;
 using SpaceEditor.Algorithms;
 using SpaceEditor.Data;
 using SpaceEditor.Rocks;
-using System;
-using System.Collections.Generic;
 using System.IO;
-using System.Linq;
 using System.Text;
 using System.Windows;
 using System.Windows.Controls;
@@ -30,7 +27,7 @@ public record ModelSettings
 
     [ButtonProperty(nameof(RecenterImp))]
     public bool Recenter { get; set; }
-    
+
     public float ModelSize { get; set; }
 
     [ButtonProperty(nameof(ScareToTargetSize))]
@@ -57,13 +54,13 @@ public record ModelSettings
         {
             var bb = model.CachedBounds;
             var dimensions = bb.Extents * 2;
-            
+
             var size = dimensions.MaxAbs;
             var targetSize = Math.Max(this.ModelSize, 1);
 
             MeshTransforms.Scale
             (
-                model, 
+                model,
                 new(targetSize / size),
                 bb.Center
             );
@@ -123,7 +120,7 @@ public partial class BlueprintGenerator : UserControl
     public DMesh3? Model;
     public AsyncLazy<DMeshAABBTree3>? ModelBVH;
     public CancellationTokenSource? ModelLifetime;
-        
+
     public CancellationTokenSource? GeneratorLifetime;
 
     private void UserControl_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
@@ -137,12 +134,12 @@ public partial class BlueprintGenerator : UserControl
 
     private ModelSettings ModelSettingsVM
     {
-        get => (ModelSettings) this.ModelSettings.ReflectedInstance;
+        get => (ModelSettings)this.ModelSettings.ReflectedInstance;
         set
         {
             // Make sure to reload the new values
             this.ModelSettings.ReflectedInstance = null!;
-            
+
             this.ModelSettings.ReflectedInstance = value;
         }
     }
@@ -172,7 +169,7 @@ public partial class BlueprintGenerator : UserControl
             model = LoadModel(selectFile.FileName);
             this.BlueprintName.Text = Path.GetFileNameWithoutExtension(selectFile.FileName);
 
-            
+
 
         }
         catch
@@ -202,7 +199,7 @@ public partial class BlueprintGenerator : UserControl
         this.ModelBVH.Poke();
 
         var bb = this.Model.CachedBounds;
-        this.ModelSettingsVM = this.ModelSettingsVM with { ModelSize = (float) bb.Extents.MaxAbs * 2 };
+        this.ModelSettingsVM = this.ModelSettingsVM with { ModelSize = (float)bb.Extents.MaxAbs * 2 };
 
         var modelInfo = new StringBuilder();
         modelInfo.AppendLine($"Model: {this.BlueprintName.Text}");
@@ -239,6 +236,7 @@ public partial class BlueprintGenerator : UserControl
 
     private async void GenerateBlueprint(object sender, RoutedEventArgs e)
     {
+        string mode;
         // Prevent accidental double-clicks from spawning multiple tasks
         if (this.IsGenerating) return;
         this.IsGenerating = true;
@@ -281,6 +279,9 @@ public partial class BlueprintGenerator : UserControl
 
             BlueprintMesh blueprint;
 
+            // Start the high-precision stopwatch right before dispatching
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
             try
             {
                 // Offload execution to a background thread, routing to CPU or GPU based on the flag
@@ -308,7 +309,8 @@ public partial class BlueprintGenerator : UserControl
                 this.ProgressText.Visibility = Visibility.Collapsed;
                 this.ProgressText.Text = string.Empty;
 
-                this.IsGenerating = false; // Unlock the UI
+                // Do NOT unlock IsGenerating here or stop the stopwatch yet. 
+                // The UI thread still needs to build and render the mesh!
             }
 
             // The code below automatically resumes on the UI thread
@@ -327,7 +329,13 @@ public partial class BlueprintGenerator : UserControl
 
             Vector3i dimensions = GetBlueprintDiemensions(usedIndicies);
 
-            string info = $"Blocks: X: {dimensions.x} Y: {dimensions.y} Z: {dimensions.z} Total: {usedIndicies.Count()}";
+            // The meshing and viewport rendering is finished. Now we stop the stopwatch.
+            stopwatch.Stop();
+
+            mode = isCpuFallback ? "CPU" : "GPU";
+            System.Diagnostics.Debug.WriteLine($"\n[PERFORMANCE] Blueprint generated in {stopwatch.Elapsed.TotalSeconds:F3} seconds using {mode}.\n");
+
+            string info = $"Blocks: X: {dimensions.x} Y: {dimensions.y} Z: {dimensions.z} Total: {usedIndicies.Count()}\nTime: {stopwatch.Elapsed.TotalSeconds:F2}s (generated using {mode})";
             this.BlueprintDetails.Text = info;
 
             lifetime.Register(() =>
@@ -347,7 +355,7 @@ public partial class BlueprintGenerator : UserControl
         }
         finally
         {
-            this.IsGenerating = false; // Failsafe unlock
+            this.IsGenerating = false; // Failsafe unlock AFTER everything is done
         }
     }
 
@@ -355,14 +363,14 @@ public partial class BlueprintGenerator : UserControl
     {
         AxisAlignedBox3i dimensions = AxisAlignedBox3i.Empty;
 
-		foreach (Vector3i v3i in indicies)
+        foreach (Vector3i v3i in indicies)
         {
             dimensions.Contain(v3i);
         }
 
         return dimensions.Diagonal + 1;
     }
-        
+
     private void ExportBlueprint(object sender, RoutedEventArgs e)
     {
         var blueprint = (BlueprintMesh)this.ExportBlueprintPanel.Tag;
@@ -391,10 +399,10 @@ public partial class BlueprintGenerator : UserControl
         saveLocation.AddExtension = true;
         saveLocation.DefaultExt = "obj";
         saveLocation.FileName = this.BlueprintName.Text;
-        
+
         if (saveLocation.ShowDialog() != true)
             return;
-        
+
         var mesh = GridMesher.Mesh(blueprint);
         Util.WriteDebugMesh(mesh, saveLocation.FileName);
     }
@@ -409,7 +417,7 @@ public partial class BlueprintGenerator : UserControl
         foreach (var m in scene.Meshes)
         {
             var vertexIndices = new List<int>();
-                
+
             var vertices = m.Vertices;
             var normals = m.HasNormals ? m.Normals : null;
             var uvs = m.HasTextureCoords(0) ? m.TextureCoordinateChannels[0] : null;
@@ -484,15 +492,15 @@ public partial class BlueprintGenerator : UserControl
     {
         var controls = this.ViewportControls.Children.OfType<FrameworkElement>().Where(x => Grid.GetRow(x) == controlsRow).ToArray();
 
-        var draw = (CheckBox) controls[1];
-        var xray = (CheckBox) controls[2];
-        var color = (ColourSlider) controls[3];
+        var draw = (CheckBox)controls[1];
+        var xray = (CheckBox)controls[2];
+        var color = (ColourSlider)controls[3];
 
         var renderData = new ModelViewport.ModelData
         {
             Mesh = model,
         };
-            
+
         RoutedEventHandler onCheckedChanged = (_, _) =>
         {
             renderData.Color = color.SelectedColour;

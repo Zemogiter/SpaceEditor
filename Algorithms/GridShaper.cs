@@ -1,16 +1,9 @@
-﻿using Assimp;
-using g4;
+﻿using g4;
 using ILGPU;
 using ILGPU.Runtime;
 using PropertyTools.DataAnnotations;
-using SpaceEditor.Algorithms;
 using SpaceEditor.Rocks;
-using System;
-using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
-using System.Linq;
-using System.Numerics;
 using System.Text;
 
 namespace SpaceEditor.Algorithms;
@@ -43,10 +36,29 @@ public class GridShaper
         this.Tree = tree;
     }
 
+    // Class to cache the GPU context and kernel globally
+    public static class GpuSetup
+    {
+        public static Context Context { get; }
+        public static Accelerator Accelerator { get; }
+        public static Action<Index1D, ArrayView<GpuTriangle>, ArrayView<int>, Float3, float, int, int, int> VoxelizeKernel { get; }
+
+        static GpuSetup()
+        {
+            Context = Context.CreateDefault();
+            Accelerator = Context.GetPreferredDevice(preferCPU: false).CreateAccelerator(Context);
+            System.Diagnostics.Debug.WriteLine($"\n[ILGPU INITIALIZATION] Compiled and Cached on: {Accelerator.Name} (Type: {Accelerator.AcceleratorType})\n");
+
+            VoxelizeKernel = Accelerator.LoadAutoGroupedStreamKernel<
+                Index1D, ArrayView<GpuTriangle>, ArrayView<int>, Float3, float, int, int, int>(
+                VoxelizationKernel.Voxelize);
+        }
+    }
+
     public static class BlockSizes
     {
         public const string TwoPointFive = "2.5m";
-        public const string HalfMeter = "0.5m (VERY VERY slow on large ships!)";
+        public const string HalfMeter = "0.5m (May be slow on large ships!)";
         public const string TwentyFiveC = nameof(TwentyFiveC);
     }
 
@@ -90,9 +102,9 @@ public class GridShaper
         var cellCount = (int)Math.Ceiling(boundingBox.MaxDim / blockSize);
         var indexer = new ShiftGridIndexer3(boundingBox.Min, blockSize);
 
-        // Initialize ILGPU Context
-        using var context = Context.CreateDefault();
-        using var accelerator = context.GetPreferredDevice(preferCPU: false).CreateAccelerator(context);
+        // Access the cached GPU environment instead of creating a new one
+        var accelerator = GpuSetup.Accelerator;
+        var voxelizeKernel = GpuSetup.VoxelizeKernel;
         System.Diagnostics.Debug.WriteLine($"\n[ILGPU VERIFICATION] Executing on: {accelerator.Name} (Type: {accelerator.AcceleratorType})\n");
 
         // Prepare Triangle Data
@@ -104,7 +116,6 @@ public class GridShaper
         foreach (var triangle in this.Mesh.EnumerateTriangles())
         {
             ct.ThrowIfCancellationRequested();
-            // Report progress periodically to avoid UI thread spam
             if (tIndex % 5000 == 0) progress?.Report((0.1 * ((double)tIndex / triangleCount), "Mesh Flattening..."));
 
             var box = triangle.ToBox();
@@ -118,23 +129,14 @@ public class GridShaper
             };
         }
 
-        // Allocate GPU Memory
         using var deviceTriangles = accelerator.Allocate1D(flatTriangles);
-
-        // Flat 1D representation of the 3D voxel grid
         int totalCells = cellCount * cellCount * cellCount;
         int[] initialGrid = new int[totalCells];
         Array.Fill(initialGrid, BlueprintMesh.NoContent);
         using var deviceGrid = accelerator.Allocate1D(initialGrid);
 
-        // Load and compile kernel
-        var voxelizeKernel = accelerator.LoadAutoGroupedStreamKernel<
-            Index1D, ArrayView<GpuTriangle>, ArrayView<int>, Float3, float, int, int, int>(
-            VoxelizationKernel.Voxelize);
-
         Float3 origin = new Float3((float)boundingBox.Min.x, (float)boundingBox.Min.y, (float)boundingBox.Min.z);
 
-        // Dispatch execution to the GPU
         voxelizeKernel(
             deviceTriangles.IntExtent,
             deviceTriangles.View,
@@ -151,15 +153,13 @@ public class GridShaper
         progress?.Report((0.40, "Voxelization..."));
         var flatResults = deviceGrid.GetAsArray1D();
 
-        // Reconstruct the internal BlueprintMesh data structure
         var bmp = new DenseGrid3i(cellCount, cellCount, cellCount, BlueprintMesh.NoContent);
 
         // PHASE 3: Grid Reconstruction (40% - 70%)
-        for (int z = 0; z < cellCount; z++)
+        int processedZ = 0;
+        var activeBlocks = new System.Collections.Concurrent.ConcurrentBag<g4.Vector3i>();
+        Parallel.For(0, cellCount, new ParallelOptions { CancellationToken = ct }, z =>
         {
-            ct.ThrowIfCancellationRequested();
-            if (z % 10 == 0) progress?.Report((0.40 + (0.30 * ((double)z / cellCount)), "Grid Reconstruction..."));
-
             for (int y = 0; y < cellCount; y++)
             {
                 for (int x = 0; x < cellCount; x++)
@@ -167,11 +167,19 @@ public class GridShaper
                     int flatIdx = x + (y * cellCount) + (z * cellCount * cellCount);
                     if (flatResults[flatIdx] == 0)
                     {
-                        bmp[new g4.Vector3i(x, y, z)] = 0;
+                        var cell = new g4.Vector3i(x, y, z);
+                        bmp[cell] = 0;
+                        activeBlocks.Add(cell);
                     }
                 }
             }
-        }
+
+            int currentZ = Interlocked.Increment(ref processedZ);
+            if (currentZ % 10 == 0)
+            {
+                progress?.Report((0.40 + (0.30 * ((double)currentZ / cellCount)), "Grid Reconstruction..."));
+            }
+        });
 
         var blueprint = new BlueprintMesh();
         blueprint.Blocks = bmp;
@@ -183,33 +191,13 @@ public class GridShaper
         };
 
         // PHASE 4: Slope Generation (70% - 100%)
-        progress?.Report((0.70, "Slope Evaluation...")); 
+        progress?.Report((0.70, "Slope Evaluation..."));
         int totalSlopePasses = (settings.SlopesUpper ? 4 : 0) + (settings.SlopesLower ? 4 : 0) + (settings.SlopesSides ? 4 : 0);
         int executedPasses = 0;
 
-        if (settings.SlopesUpper)
-        {
-            ExecSlopes(1);
-            ExecSlopes(2);
-            ExecSlopes(3);
-            ExecSlopes(4);
-        }
-
-        if (settings.SlopesLower)
-        {
-            ExecSlopes(5);
-            ExecSlopes(6);
-            ExecSlopes(7);
-            ExecSlopes(8);
-        }
-
-        if (settings.SlopesSides)
-        {
-            ExecSlopes(9);
-            ExecSlopes(10);
-            ExecSlopes(11);
-            ExecSlopes(12);
-        }
+        if (settings.SlopesUpper) { ExecSlopes(1); ExecSlopes(2); ExecSlopes(3); ExecSlopes(4); }
+        if (settings.SlopesLower) { ExecSlopes(5); ExecSlopes(6); ExecSlopes(7); ExecSlopes(8); }
+        if (settings.SlopesSides) { ExecSlopes(9); ExecSlopes(10); ExecSlopes(11); ExecSlopes(12); }
 
         void ExecSlopes(int content)
         {
@@ -219,42 +207,38 @@ public class GridShaper
             var supportDirectionA = -probeDirectionA;
             var supportDirectionB = -probeDirectionB;
 
-            foreach (var g in bmp.Indices())
+            // Multithreaded Slope Evaluation strictly over filled blocks
+            System.Threading.Tasks.Parallel.ForEach(activeBlocks, new System.Threading.Tasks.ParallelOptions { CancellationToken = ct }, g =>
             {
-                ct.ThrowIfCancellationRequested();
+                if (blueprint[g] != 0) return; // 'return' breaks out of the lambda for this specific block
 
-                if (blueprint[g] != 0) continue;
-
-                if(blueprint[g + probeDirectionA] != BlueprintMesh.NoContent ||blueprint[g + probeDirectionB] != BlueprintMesh.NoContent)
+                if (blueprint[g + probeDirectionA] != BlueprintMesh.NoContent || blueprint[g + probeDirectionB] != BlueprintMesh.NoContent)
                 {
-                    continue;
+                    return;
                 }
 
                 if (settings.SlopesMustBeSupported)
                 {
-                    ct.ThrowIfCancellationRequested();
-                    if(blueprint[g + supportDirectionA] != 0 || blueprint[g + supportDirectionB] != 0)
+                    if (blueprint[g + supportDirectionA] != 0 || blueprint[g + supportDirectionB] != 0)
                     {
-                        continue;
+                        return;
                     }
                 }
 
                 bmp[g] = content;
+            });
+
+            if (totalSlopePasses > 0)
+            {
+                int currentPass = System.Threading.Interlocked.Increment(ref executedPasses);
+                progress?.Report((0.70 + (0.30 * ((double)currentPass / totalSlopePasses)), "Slope Evaluation..."));
             }
         }
 
-        // Report progress after each directional pass completes
-        if (totalSlopePasses > 0)
-        {
-            executedPasses++;
-            progress?.Report((0.70 + (0.30 * ((double)executedPasses / totalSlopePasses)), "Slope Evaluation..."));
-        }
-
-        progress?.Report((1.0, "Complete!"));
+        progress?.Report((1.0, "Complete, finalization!"));
         return blueprint;
     }
 
-    //Old, CPU based rendering. Kept here as a legacy option, in case using the GPU is not feasible for some reason. It is significantly slower than the GPU version, especially for large meshes.
     public BlueprintMesh GenerateCpu(GeneratorSettings settings, CancellationToken ct, IProgress<(double, string)> progress = null)
     {
         var blockSize = settings.BlockSize switch
@@ -266,18 +250,19 @@ public class GridShaper
         var minimalBounds = this.Tree.Bounds;
         minimalBounds.Min -= blockSize;
         minimalBounds.Max += blockSize;
-        
+
         var boundingBox = new AxisAlignedBox3d(new Vector3d(0), blockSize / 2);
         while (boundingBox.Contains(minimalBounds) == false)
         {
             boundingBox.Scale(2, 2, 2);
         }
 
-        var cellCount = (int) Math.Ceiling(boundingBox.MaxDim / blockSize);
+        System.Diagnostics.Debug.WriteLine($"\nExecuting the model to blueprint conversion on the CPU\n");
+        var cellCount = (int)Math.Ceiling(boundingBox.MaxDim / blockSize);
         var indexer = new ShiftGridIndexer3(boundingBox.Min, blockSize);
 
         var bmp = new DenseGrid3i(cellCount, cellCount, cellCount, BlueprintMesh.NoContent);
-        
+
         var blueprint = new BlueprintMesh();
         blueprint.Blocks = bmp;
         blueprint.Coords = indexer;
@@ -307,33 +292,23 @@ public class GridShaper
             }
         }
 
-        progress?.Report((0.70, "Dispatch & Execution..."));
+        // OPTIMIZATION: Gather only the active blocks to eliminate millions of empty-space checks
+        var activeBlocks = new List<g4.Vector3i>();
+        foreach (var g in bmp.Indices())
+        {
+            if (bmp[g] == 0)
+            {
+                activeBlocks.Add(g);
+            }
+        }
+
+        progress?.Report((0.70, "Slope Evaluation..."));
         int totalSlopePasses = (settings.SlopesUpper ? 4 : 0) + (settings.SlopesLower ? 4 : 0) + (settings.SlopesSides ? 4 : 0);
         int executedPasses = 0;
 
-        if (settings.SlopesUpper)
-        {
-            ExecSlopes(1);
-            ExecSlopes(2);
-            ExecSlopes(3);
-            ExecSlopes(4);
-        }
-
-        if (settings.SlopesLower)
-        {
-            ExecSlopes(5);
-            ExecSlopes(6);
-            ExecSlopes(7);
-            ExecSlopes(8);
-        }
-
-        if (settings.SlopesSides)
-        {
-            ExecSlopes(9);
-            ExecSlopes(10);
-            ExecSlopes(11);
-            ExecSlopes(12);
-        }
+        if (settings.SlopesUpper) { ExecSlopes(1); ExecSlopes(2); ExecSlopes(3); ExecSlopes(4); }
+        if (settings.SlopesLower) { ExecSlopes(5); ExecSlopes(6); ExecSlopes(7); ExecSlopes(8); }
+        if (settings.SlopesSides) { ExecSlopes(9); ExecSlopes(10); ExecSlopes(11); ExecSlopes(12); }
 
         void ExecSlopes(int content)
         {
@@ -343,39 +318,37 @@ public class GridShaper
             var supportDirectionA = -probeDirectionA;
             var supportDirectionB = -probeDirectionB;
 
-            foreach (var g in bmp.Indices())
+            // Multithreaded Slope Evaluation strictly over filled blocks
+            System.Threading.Tasks.Parallel.ForEach(activeBlocks, new System.Threading.Tasks.ParallelOptions { CancellationToken = ct }, g =>
             {
-                ct.ThrowIfCancellationRequested();
-                if (blueprint[g] != 0)
-                    continue;
+                if (blueprint[g] != 0) return;
 
-                if(blueprint[g + probeDirectionA] != BlueprintMesh.NoContent || blueprint[g + probeDirectionB] != BlueprintMesh.NoContent)
+                if (blueprint[g + probeDirectionA] != BlueprintMesh.NoContent || blueprint[g + probeDirectionB] != BlueprintMesh.NoContent)
                 {
-                    continue;
+                    return;
                 }
 
                 if (settings.SlopesMustBeSupported)
                 {
-                    if(blueprint[g + supportDirectionA] != 0 || blueprint[g + supportDirectionB] != 0)
+                    if (blueprint[g + supportDirectionA] != 0 || blueprint[g + supportDirectionB] != 0)
                     {
-                        continue;
+                        return;
                     }
                 }
 
                 bmp[g] = content;
-            }
+            });
 
             if (totalSlopePasses > 0)
             {
-                executedPasses++;
-                progress?.Report((0.70 + (0.30 * ((double)executedPasses / totalSlopePasses)), "Slope Evaluation..."));
+                int currentPass = System.Threading.Interlocked.Increment(ref executedPasses);
+                progress?.Report((0.70 + (0.30 * ((double)currentPass / totalSlopePasses)), "Slope Evaluation..."));
             }
         }
 
         progress?.Report((1.0, "Complete!"));
         return blueprint;
     }
-}
 
     public class GridMesher
     {
@@ -674,129 +647,130 @@ public class GridShaper
         }
     }
 
-public static class VoxelizationKernel
-{
-    // GPU-safe math implementations
-    private static int Min(int a, int b) => a < b ? a : b;
-    private static int Max(int a, int b) => a > b ? a : b;
-    private static float Min(float a, float b) => a < b ? a : b;
-    private static float Max(float a, float b) => a > b ? a : b;
-    private static float Abs(float v) => v < 0f ? -v : v;
-    private static float Min3(float a, float b, float c) => Min(a, Min(b, c));
-    private static float Max3(float a, float b, float c) => Max(a, Max(b, c));
-    private static int Floor(float val) => val < 0f ? (int)val - 1 : (int)val;
-    private static int Ceiling(float val) => val > (int)val ? (int)val + 1 : (int)val;
-
-    public static void Voxelize(
-        Index1D index,
-        ArrayView<GpuTriangle> triangles,
-        ArrayView<int> voxelGrid,
-        Float3 gridOrigin,
-        float cellSize,
-        int gridX,
-        int gridY,
-        int gridZ)
+    public static class VoxelizationKernel
     {
-        var tri = triangles[index];
+        // GPU-safe math implementations
+        private static int Min(int a, int b) => a < b ? a : b;
+        private static int Max(int a, int b) => a > b ? a : b;
+        private static float Min(float a, float b) => a < b ? a : b;
+        private static float Max(float a, float b) => a > b ? a : b;
+        private static float Abs(float v) => v < 0f ? -v : v;
+        private static float Min3(float a, float b, float c) => Min(a, Min(b, c));
+        private static float Max3(float a, float b, float c) => Max(a, Max(b, c));
+        private static int Floor(float val) => val < 0f ? (int)val - 1 : (int)val;
+        private static int Ceiling(float val) => val > (int)val ? (int)val + 1 : (int)val;
 
-        int minX = Max(0, Floor((tri.MinBounds.X - gridOrigin.X) / cellSize));
-        int minY = Max(0, Floor((tri.MinBounds.Y - gridOrigin.Y) / cellSize));
-        int minZ = Max(0, Floor((tri.MinBounds.Z - gridOrigin.Z) / cellSize));
-
-        int maxX = Min(gridX - 1, Ceiling((tri.MaxBounds.X - gridOrigin.X) / cellSize));
-        int maxY = Min(gridY - 1, Ceiling((tri.MaxBounds.Y - gridOrigin.Y) / cellSize));
-        int maxZ = Min(gridZ - 1, Ceiling((tri.MaxBounds.Z - gridOrigin.Z) / cellSize));
-
-        // OPTIMIZATION 1: Precompute triangle edges and normal outside the loop
-        float e0X = tri.V1.X - tri.V0.X; float e0Y = tri.V1.Y - tri.V0.Y; float e0Z = tri.V1.Z - tri.V0.Z;
-        float e1X = tri.V2.X - tri.V1.X; float e1Y = tri.V2.Y - tri.V1.Y; float e1Z = tri.V2.Z - tri.V1.Z;
-        float e2X = tri.V0.X - tri.V2.X; float e2Y = tri.V0.Y - tri.V2.Y; float e2Z = tri.V0.Z - tri.V2.Z;
-
-        float normalX = e0Y * e1Z - e0Z * e1Y;
-        float normalY = e0Z * e1X - e0X * e1Z;
-        float normalZ = e0X * e1Y - e0Y * e1X;
-
-        for (int z = minZ; z <= maxZ; z++)
+        public static void Voxelize(
+            Index1D index,
+            ArrayView<GpuTriangle> triangles,
+            ArrayView<int> voxelGrid,
+            Float3 gridOrigin,
+            float cellSize,
+            int gridX,
+            int gridY,
+            int gridZ)
         {
-            for (int y = minY; y <= maxY; y++)
+            var tri = triangles[index];
+
+            int minX = Max(0, Floor((tri.MinBounds.X - gridOrigin.X) / cellSize));
+            int minY = Max(0, Floor((tri.MinBounds.Y - gridOrigin.Y) / cellSize));
+            int minZ = Max(0, Floor((tri.MinBounds.Z - gridOrigin.Z) / cellSize));
+
+            int maxX = Min(gridX - 1, Ceiling((tri.MaxBounds.X - gridOrigin.X) / cellSize));
+            int maxY = Min(gridY - 1, Ceiling((tri.MaxBounds.Y - gridOrigin.Y) / cellSize));
+            int maxZ = Min(gridZ - 1, Ceiling((tri.MaxBounds.Z - gridOrigin.Z) / cellSize));
+
+            // OPTIMIZATION 1: Precompute triangle edges and normal outside the loop
+            float e0X = tri.V1.X - tri.V0.X; float e0Y = tri.V1.Y - tri.V0.Y; float e0Z = tri.V1.Z - tri.V0.Z;
+            float e1X = tri.V2.X - tri.V1.X; float e1Y = tri.V2.Y - tri.V1.Y; float e1Z = tri.V2.Z - tri.V1.Z;
+            float e2X = tri.V0.X - tri.V2.X; float e2Y = tri.V0.Y - tri.V2.Y; float e2Z = tri.V0.Z - tri.V2.Z;
+
+            float normalX = e0Y * e1Z - e0Z * e1Y;
+            float normalY = e0Z * e1X - e0X * e1Z;
+            float normalZ = e0X * e1Y - e0Y * e1X;
+
+            for (int z = minZ; z <= maxZ; z++)
             {
-                for (int x = minX; x <= maxX; x++)
+                for (int y = minY; y <= maxY; y++)
                 {
-                    Float3 cellCenter = new Float3(
-                        gridOrigin.X + (x + 0.5f) * cellSize,
-                        gridOrigin.Y + (y + 0.5f) * cellSize,
-                        gridOrigin.Z + (z + 0.5f) * cellSize
-                    );
-
-                    // Pass precomputed values into the intersection test
-                    if (CheckTriangleBoxIntersection(tri, cellCenter, cellSize,
-                        e0X, e0Y, e0Z, e1X, e1Y, e1Z, e2X, e2Y, e2Z, normalX, normalY, normalZ))
+                    for (int x = minX; x <= maxX; x++)
                     {
-                        int flatIndex = x + (y * gridX) + (z * gridX * gridY);
+                        Float3 cellCenter = new Float3(
+                            gridOrigin.X + (x + 0.5f) * cellSize,
+                            gridOrigin.Y + (y + 0.5f) * cellSize,
+                            gridOrigin.Z + (z + 0.5f) * cellSize
+                        );
 
-                        // OPTIMIZATION 2: Cache-friendly early exit prevents memory bus locking
-                        if (voxelGrid[flatIndex] != 0)
+                        // Pass precomputed values into the intersection test
+                        if (CheckTriangleBoxIntersection(tri, cellCenter, cellSize,
+                            e0X, e0Y, e0Z, e1X, e1Y, e1Z, e2X, e2Y, e2Z, normalX, normalY, normalZ))
                         {
-                            Atomic.Exchange(ref voxelGrid[flatIndex], 0);
+                            int flatIndex = x + (y * gridX) + (z * gridX * gridY);
+
+                            // OPTIMIZATION 2: Cache-friendly early exit prevents memory bus locking
+                            if (voxelGrid[flatIndex] != 0)
+                            {
+                                Atomic.Exchange(ref voxelGrid[flatIndex], 0);
+                            }
                         }
                     }
                 }
             }
         }
-    }
 
-    private static bool CheckTriangleBoxIntersection(
-        GpuTriangle tri, Float3 boxCenter, float cellSize,
-        float e0X, float e0Y, float e0Z,
-        float e1X, float e1Y, float e1Z,
-        float e2X, float e2Y, float e2Z,
-        float normalX, float normalY, float normalZ)
-    {
-        float boxHalf = cellSize * 0.5f;
+        private static bool CheckTriangleBoxIntersection(
+            GpuTriangle tri, Float3 boxCenter, float cellSize,
+            float e0X, float e0Y, float e0Z,
+            float e1X, float e1Y, float e1Z,
+            float e2X, float e2Y, float e2Z,
+            float normalX, float normalY, float normalZ)
+        {
+            float boxHalf = cellSize * 0.5f;
 
-        // Shift triangle to local AABB coordinate space
-        float v0X = tri.V0.X - boxCenter.X; float v0Y = tri.V0.Y - boxCenter.Y; float v0Z = tri.V0.Z - boxCenter.Z;
-        float v1X = tri.V1.X - boxCenter.X; float v1Y = tri.V1.Y - boxCenter.Y; float v1Z = tri.V1.Z - boxCenter.Z;
-        float v2X = tri.V2.X - boxCenter.X; float v2Y = tri.V2.Y - boxCenter.Y; float v2Z = tri.V2.Z - boxCenter.Z;
+            // Shift triangle to local AABB coordinate space
+            float v0X = tri.V0.X - boxCenter.X; float v0Y = tri.V0.Y - boxCenter.Y; float v0Z = tri.V0.Z - boxCenter.Z;
+            float v1X = tri.V1.X - boxCenter.X; float v1Y = tri.V1.Y - boxCenter.Y; float v1Z = tri.V1.Z - boxCenter.Z;
+            float v2X = tri.V2.X - boxCenter.X; float v2Y = tri.V2.Y - boxCenter.Y; float v2Z = tri.V2.Z - boxCenter.Z;
 
-        // SAT Test 1: Box AABB bounds
-        if (Min3(v0X, v1X, v2X) > boxHalf || Max3(v0X, v1X, v2X) < -boxHalf) return false;
-        if (Min3(v0Y, v1Y, v2Y) > boxHalf || Max3(v0Y, v1Y, v2Y) < -boxHalf) return false;
-        if (Min3(v0Z, v1Z, v2Z) > boxHalf || Max3(v0Z, v1Z, v2Z) < -boxHalf) return false;
+            // SAT Test 1: Box AABB bounds
+            if (Min3(v0X, v1X, v2X) > boxHalf || Max3(v0X, v1X, v2X) < -boxHalf) return false;
+            if (Min3(v0Y, v1Y, v2Y) > boxHalf || Max3(v0Y, v1Y, v2Y) < -boxHalf) return false;
+            if (Min3(v0Z, v1Z, v2Z) > boxHalf || Max3(v0Z, v1Z, v2Z) < -boxHalf) return false;
 
-        // SAT Test 2: Triangle Plane vs Box Overlap
-        float d = -(normalX * v0X + normalY * v0Y + normalZ * v0Z);
+            // SAT Test 2: Triangle Plane vs Box Overlap
+            float d = -(normalX * v0X + normalY * v0Y + normalZ * v0Z);
 
-        float vminX = normalX > 0f ? -boxHalf : boxHalf; float vmaxX = normalX > 0f ? boxHalf : -boxHalf;
-        float vminY = normalY > 0f ? -boxHalf : boxHalf; float vmaxY = normalY > 0f ? boxHalf : -boxHalf;
-        float vminZ = normalZ > 0f ? -boxHalf : boxHalf; float vmaxZ = normalZ > 0f ? boxHalf : -boxHalf;
+            float vminX = normalX > 0f ? -boxHalf : boxHalf; float vmaxX = normalX > 0f ? boxHalf : -boxHalf;
+            float vminY = normalY > 0f ? -boxHalf : boxHalf; float vmaxY = normalY > 0f ? boxHalf : -boxHalf;
+            float vminZ = normalZ > 0f ? -boxHalf : boxHalf; float vmaxZ = normalZ > 0f ? boxHalf : -boxHalf;
 
-        if ((normalX * vminX + normalY * vminY + normalZ * vminZ) + d > 0f) return false;
-        if ((normalX * vmaxX + normalY * vmaxY + normalZ * vmaxZ) + d < 0f) return false;
+            if ((normalX * vminX + normalY * vminY + normalZ * vminZ) + d > 0f) return false;
+            if ((normalX * vmaxX + normalY * vmaxY + normalZ * vmaxZ) + d < 0f) return false;
 
-        // SAT Test 3: Edge Cross Products
-        if (!AxisTest(e0Z, -e0Y, v0Y, v0Z, v2Y, v2Z, boxHalf)) return false;
-        if (!AxisTest(e1Z, -e1Y, v1Y, v1Z, v0Y, v0Z, boxHalf)) return false;
-        if (!AxisTest(e2Z, -e2Y, v2Y, v2Z, v1Y, v1Z, boxHalf)) return false;
+            // SAT Test 3: Edge Cross Products
+            if (!AxisTest(e0Z, -e0Y, v0Y, v0Z, v2Y, v2Z, boxHalf)) return false;
+            if (!AxisTest(e1Z, -e1Y, v1Y, v1Z, v0Y, v0Z, boxHalf)) return false;
+            if (!AxisTest(e2Z, -e2Y, v2Y, v2Z, v1Y, v1Z, boxHalf)) return false;
 
-        if (!AxisTest(-e0Z, e0X, v0X, v0Z, v2X, v2Z, boxHalf)) return false;
-        if (!AxisTest(-e1Z, e1X, v1X, v1Z, v0X, v0Z, boxHalf)) return false;
-        if (!AxisTest(-e2Z, e2X, v2X, v2Z, v1X, v1Z, boxHalf)) return false;
+            if (!AxisTest(-e0Z, e0X, v0X, v0Z, v2X, v2Z, boxHalf)) return false;
+            if (!AxisTest(-e1Z, e1X, v1X, v1Z, v0X, v0Z, boxHalf)) return false;
+            if (!AxisTest(-e2Z, e2X, v2X, v2Z, v1X, v1Z, boxHalf)) return false;
 
-        if (!AxisTest(e0Y, -e0X, v0X, v0Y, v2X, v2Y, boxHalf)) return false;
-        if (!AxisTest(e1Y, -e1X, v1X, v1Y, v0X, v0Y, boxHalf)) return false;
-        if (!AxisTest(e2Y, -e2X, v2X, v2Y, v1X, v1Y, boxHalf)) return false;
+            if (!AxisTest(e0Y, -e0X, v0X, v0Y, v2X, v2Y, boxHalf)) return false;
+            if (!AxisTest(e1Y, -e1X, v1X, v1Y, v0X, v0Y, boxHalf)) return false;
+            if (!AxisTest(e2Y, -e2X, v2X, v2Y, v1X, v1Y, boxHalf)) return false;
 
-        return true;
-    }
+            return true;
+        }
 
-    private static bool AxisTest(float a, float b, float fa, float fb, float va, float vb, float boxHalf)
-    {
-        float p0 = a * fa + b * fb;
-        float p2 = a * va + b * vb;
-        float min = Min(p0, p2);
-        float max = Max(p0, p2);
-        float rad = (Abs(a) + Abs(b)) * boxHalf;
-        return !(min > rad || max < -rad);
+        private static bool AxisTest(float a, float b, float fa, float fb, float va, float vb, float boxHalf)
+        {
+            float p0 = a * fa + b * fb;
+            float p2 = a * va + b * vb;
+            float min = Min(p0, p2);
+            float max = Max(p0, p2);
+            float rad = (Abs(a) + Abs(b)) * boxHalf;
+            return !(min > rad || max < -rad);
+        }
     }
 }

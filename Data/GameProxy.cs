@@ -98,6 +98,13 @@ public class GameProxy
     public AsyncLazy<InputIds> InputIds { get; }
     public AsyncLazy<InputActions> InputActions { get; }
 
+    // Pre-cached reflection types to eliminate massive loop bottlenecks
+    private readonly Type _customSerializationContextType;
+    private readonly Type _serializationContextType;
+    private readonly Type _serializationHelperType;
+    private readonly object _jsonFormatEnumValue;
+    private readonly MethodInfo _serializeAbstractMethod;
+
     public GameProxy(string baseGamePath)
     {
         this.BaseGamePath = baseGamePath;
@@ -112,6 +119,13 @@ public class GameProxy
         var md = st.AsDynamicType().GetInstance(mdt);
         md.PushContext(new[] { se2 });
 
+        // CACHE TYPES ONCE AT STARTUP
+        _customSerializationContextType = FindType("CustomSerializationContext");
+        _serializationContextType = FindType("SerializationContext");
+        _serializationHelperType = FindType("SerializationHelper");
+        _jsonFormatEnumValue = Enum.Parse(FindType("SerializerFormat"), "Json");
+        _serializeAbstractMethod = _serializationHelperType.GetMethod("SerializeAbstract")!.MakeGenericMethod(typeof(object));
+
         this.InputIds = new(LoadInputIds);
         this.InputActions = new(LoadInputActions);
     }
@@ -124,31 +138,31 @@ public class GameProxy
 
     public dynamic DeserializeFile(string filePath, params object[] services)
     {
-        using var fs = new FileStream(filePath, FileMode.Open);
+        using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
         return DeserializeObject(fs, services);
     }
 
     public dynamic DeserializeObject(Stream content, params object[] services)
     {
-        var typedServices = Array.CreateInstance(FindType("CustomSerializationContext"), services.Length);
+        // Use pre-cached types instead of FindType() and Enum.Parse()
+        var typedServices = Array.CreateInstance(_customSerializationContextType, services.Length);
         Array.Copy(services, typedServices, services.Length);
 
-        var format = Enum.Parse(FindType("SerializerFormat"), "Json");
-
-        using var sc = (IDisposable)Activator.CreateInstance(FindType("SerializationContext"), content, "NoName.txt", typedServices)!;
-        return FindType("SerializationHelper").AsDynamicType().DeserializeAbstract<object>(sc, format);
+        using var sc = (IDisposable)Activator.CreateInstance(_serializationContextType, content, "NoName.txt", typedServices)!;
+        return _serializationHelperType.AsDynamicType().DeserializeAbstract<object>(sc, _jsonFormatEnumValue);
     }
 
     public string SerializeObject(object instance, params object[] services)
     {
-        var typedServices = Array.CreateInstance(FindType("CustomSerializationContext"), services.Length);
+        // Use pre-cached types
+        var typedServices = Array.CreateInstance(_customSerializationContextType, services.Length);
         Array.Copy(services, typedServices, services.Length);
 
-        var format = Enum.Parse(FindType("SerializerFormat"), "Json");
-
         using var data = new MemoryStream();
-        using var sc = (IDisposable)Activator.CreateInstance(FindType("SerializationContext"), data, "NoName.txt", typedServices)!;
-        FindType("SerializationHelper").GetMethod("SerializeAbstract")!.MakeGenericMethod(typeof(object)).Invoke(null, [sc, instance, format]);
+        using var sc = (IDisposable)Activator.CreateInstance(_serializationContextType, data, "NoName.txt", typedServices)!;
+
+        // Use pre-cached MethodInfo
+        _serializeAbstractMethod.Invoke(null, [sc, instance, _jsonFormatEnumValue]);
 
         return Encoding.UTF8.GetString(data.GetBuffer().AsSpan()[..(int)data.Length]);
     }
@@ -156,18 +170,21 @@ public class GameProxy
     private InputActions LoadInputActions()
     {
         var actions = new InputActions();
-
         var inputActionDefinitionType = FindType("InputActionDefinition");
-
         var actionsDir = GameFacts.GetActionsPath(this.BaseGamePath);
+
+        // Dedicated lock object prevents global thread locking issues
+        object syncObj = new object();
+
         Parallel.ForEach(Directory.EnumerateFiles(actionsDir), file =>
         {
             try
             {
                 var def = DeserializeFile(file);
-
                 Guid id = def.Guid;
-                lock (actionsDir)
+
+                // Safely lock using the dedicated object
+                lock (syncObj)
                 {
                     actions.Actions.Add(id, new InputActions.InputActionInfo
                     {
@@ -181,7 +198,6 @@ public class GameProxy
             catch
             { }
         });
-
 
         var proxy = new ProxyGenerator();
         var mapGuidToDefinitionInstance = proxy.CreateClassProxy

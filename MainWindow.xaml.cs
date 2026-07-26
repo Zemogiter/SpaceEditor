@@ -89,11 +89,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 token.ThrowIfCancellationRequested();
 
                 // 2. Pre-warm the Blueprint Generator's heavy static meshes in the background.
-                _ = SpaceEditor.Algorithms.ShapeDB.LargeShapes;
-                _ = SpaceEditor.Algorithms.ShapeDB.MidShapes;
+                _ = Algorithms.GridShaper.ShapeDB.LargeShapes;
+                _ = Algorithms.GridShaper.ShapeDB.MidShapes;
 
                 // 3. Pre-compile the ILGPU Kernel in the background
-                _ = SpaceEditor.Algorithms.GridShaper.GpuSetup.Accelerator;
+                _ = Algorithms.GridShaper.GpuSetup.Accelerator;
 
                 return proxy;
             }, token);
