@@ -173,17 +173,28 @@ public class GameProxy
         var inputActionDefinitionType = FindType("InputActionDefinition");
         var actionsDir = GameFacts.GetActionsPath(this.BaseGamePath);
 
-        // Dedicated lock object prevents global thread locking issues
         object syncObj = new object();
 
-        Parallel.ForEach(Directory.EnumerateFiles(actionsDir), file =>
+        // 1. FILTER: Only process actual data files to stop blind SerializationExceptions
+        var validFiles = Directory.EnumerateFiles(actionsDir)
+            .Where(f => f.EndsWith(".sbc", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".json", StringComparison.OrdinalIgnoreCase));
+
+        Parallel.ForEach(validFiles, file =>
         {
             try
             {
+                // 2. FAST PATH: If the file doesn't contain a Guid, it's not an input action. 
+                // Skip it instantly to prevent VRage SerializationExceptions and RuntimeBinderExceptions.
+                string contentPreview = File.ReadAllText(file);
+                if (!contentPreview.Contains("Guid") && !contentPreview.Contains("guid"))
+                    return;
+
                 var def = DeserializeFile(file);
+                if (def == null) return;
+
+                // We know it has a Guid now, so the dynamic binder won't crash
                 Guid id = def.Guid;
 
-                // Safely lock using the dedicated object
                 lock (syncObj)
                 {
                     actions.Actions.Add(id, new InputActions.InputActionInfo
@@ -196,7 +207,9 @@ public class GameProxy
                 }
             }
             catch
-            { }
+            {
+                // Ignore any files that genuinely fail serialization
+            }
         });
 
         var proxy = new ProxyGenerator();
@@ -237,11 +250,24 @@ public class GameProxy
                     if (kind is null)
                         continue;
 
-                    var inputId = DynamicHelper.Unwrap(input.GetValue(null).AsDynamic().Id);
-                    kind.Add(inputId);
+                    try
+                    {
+                        var val = input.GetValue(null);
+                        if (val == null) continue;
 
-                    dynamicProvider.TryGetName(inputId, out string displayName);
-                    inputIds.InputIdToDisplayName.Add(inputId, displayName);
+                        // 3. SAFE REFLECTION: Check if the 'Id' property exists before touching the dynamic binder
+                        var type = val.GetType();
+                        if (type.GetProperty("Id") == null && type.GetField("Id") == null)
+                            continue; // Safely skip without throwing a RuntimeBinderException
+
+                        var inputId = DynamicHelper.Unwrap(val.AsDynamic().Id);
+                        kind.Add(inputId);
+
+                        dynamicProvider.TryGetName(inputId, out string displayName);
+                        inputIds.InputIdToDisplayName.Add(inputId, displayName);
+                    }
+                    catch
+                    { }
                 }
             }
 

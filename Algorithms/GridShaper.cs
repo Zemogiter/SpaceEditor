@@ -36,22 +36,41 @@ public class GridShaper
         this.Tree = tree;
     }
 
-    // Class to cache the GPU context and kernel globally
+    // Class to cache the GPU context and kernels globally
     public static class GpuSetup
     {
-        public static Context Context { get; }
-        public static Accelerator Accelerator { get; }
-        public static Action<Index1D, ArrayView<GpuTriangle>, ArrayView<int>, Float3, float, int, int, int> VoxelizeKernel { get; }
+        public static Context Context { get; private set; }
+        public static Accelerator Accelerator { get; private set; }
+        public static Action<Index1D, ArrayView<GpuTriangle>, ArrayView<int>, Float3, float, int, int, int> VoxelizeKernel { get; private set; }
+        public static Action<Index1D, ArrayView<int>, int> InitGridKernel { get; private set; }
+
+        public static readonly object SyncLock = new object();
 
         static GpuSetup()
         {
-            Context = Context.CreateDefault();
-            Accelerator = Context.GetPreferredDevice(preferCPU: false).CreateAccelerator(Context);
-            System.Diagnostics.Debug.WriteLine($"\n[ILGPU INITIALIZATION] Compiled and Cached on: {Accelerator.Name} (Type: {Accelerator.AcceleratorType})\n");
+            RebuildContext();
+        }
 
-            VoxelizeKernel = Accelerator.LoadAutoGroupedStreamKernel<
-                Index1D, ArrayView<GpuTriangle>, ArrayView<int>, Float3, float, int, int, int>(
-                VoxelizationKernel.Voxelize);
+        public static void RebuildContext()
+        {
+            lock (SyncLock)
+            {
+                // Force ILGPU to release all cached VRAM pools back to the OS
+                try { Accelerator?.Dispose(); } catch { }
+                try { Context?.Dispose(); } catch { }
+
+                Context = Context.CreateDefault();
+                Accelerator = Context.GetPreferredDevice(preferCPU: false).CreateAccelerator(Context);
+                System.Diagnostics.Debug.WriteLine($"\n[ILGPU INITIALIZATION] Compiled and Cached on: {Accelerator.Name} (Type: {Accelerator.AcceleratorType})\n");
+
+                VoxelizeKernel = Accelerator.LoadAutoGroupedStreamKernel<
+                    Index1D, ArrayView<GpuTriangle>, ArrayView<int>, Float3, float, int, int, int>(
+                    VoxelizationKernel.Voxelize);
+
+                InitGridKernel = Accelerator.LoadAutoGroupedStreamKernel<
+                    Index1D, ArrayView<int>, int>(
+                    VoxelizationKernel.InitializeGrid);
+            }
         }
     }
 
@@ -81,227 +100,190 @@ public class GridShaper
         ];
     }
 
+    // --- PUBLIC FACADES ---
+    // These methods are the entry points for generating a blueprint mesh, either using GPU acceleration or CPU processing.
     public BlueprintMesh Generate(GeneratorSettings settings, CancellationToken ct, IProgress<(double, string)> progress = null)
-    {
-        var blockSize = settings.BlockSize switch
-        {
-            BlockSizes.TwoPointFive => ShapeDB.LargeBlockSize,
-            BlockSizes.HalfMeter => ShapeDB.MidBlockSize
-        };
-
-        var minimalBounds = this.Tree.Bounds;
-        minimalBounds.Min -= blockSize;
-        minimalBounds.Max += blockSize;
-
-        var boundingBox = new g4.AxisAlignedBox3d(new g4.Vector3d(0), blockSize / 2);
-        while (boundingBox.Contains(minimalBounds) == false)
-        {
-            boundingBox.Scale(2, 2, 2);
-        }
-
-        var cellCount = (int)Math.Ceiling(boundingBox.MaxDim / blockSize);
-        var indexer = new ShiftGridIndexer3(boundingBox.Min, blockSize);
-
-        // Access the cached GPU environment instead of creating a new one
-        var accelerator = GpuSetup.Accelerator;
-        var voxelizeKernel = GpuSetup.VoxelizeKernel;
-        System.Diagnostics.Debug.WriteLine($"\n[ILGPU VERIFICATION] Executing on: {accelerator.Name} (Type: {accelerator.AcceleratorType})\n");
-
-        // Prepare Triangle Data
-        int triangleCount = this.Mesh.TriangleCount;
-        var flatTriangles = new GpuTriangle[triangleCount];
-        int tIndex = 0;
-
-        // PHASE 1: Triangles (0% - 10%)
-        foreach (var triangle in this.Mesh.EnumerateTriangles())
-        {
-            ct.ThrowIfCancellationRequested();
-            if (tIndex % 5000 == 0) progress?.Report((0.1 * ((double)tIndex / triangleCount), "Mesh Flattening..."));
-
-            var box = triangle.ToBox();
-            flatTriangles[tIndex++] = new GpuTriangle
-            {
-                V0 = new Float3((float)triangle.V0.x, (float)triangle.V0.y, (float)triangle.V0.z),
-                V1 = new Float3((float)triangle.V1.x, (float)triangle.V1.y, (float)triangle.V1.z),
-                V2 = new Float3((float)triangle.V2.x, (float)triangle.V2.y, (float)triangle.V2.z),
-                MinBounds = new Float3((float)box.Min.x, (float)box.Min.y, (float)box.Min.z),
-                MaxBounds = new Float3((float)box.Max.x, (float)box.Max.y, (float)box.Max.z)
-            };
-        }
-
-        using var deviceTriangles = accelerator.Allocate1D(flatTriangles);
-        int totalCells = cellCount * cellCount * cellCount;
-        int[] initialGrid = new int[totalCells];
-        Array.Fill(initialGrid, BlueprintMesh.NoContent);
-        using var deviceGrid = accelerator.Allocate1D(initialGrid);
-
-        Float3 origin = new Float3((float)boundingBox.Min.x, (float)boundingBox.Min.y, (float)boundingBox.Min.z);
-
-        voxelizeKernel(
-            deviceTriangles.IntExtent,
-            deviceTriangles.View,
-            deviceGrid.View,
-            origin,
-            blockSize,
-            cellCount,
-            cellCount,
-            cellCount
-        );
-
-        // PHASE 2: Voxelization (Jump to 40% after sync)
-        accelerator.Synchronize();
-        progress?.Report((0.40, "Voxelization..."));
-        var flatResults = deviceGrid.GetAsArray1D();
-
-        var bmp = new DenseGrid3i(cellCount, cellCount, cellCount, BlueprintMesh.NoContent);
-
-        // PHASE 3: Grid Reconstruction (40% - 70%)
-        int processedZ = 0;
-        var activeBlocks = new System.Collections.Concurrent.ConcurrentBag<g4.Vector3i>();
-        Parallel.For(0, cellCount, new ParallelOptions { CancellationToken = ct }, z =>
-        {
-            for (int y = 0; y < cellCount; y++)
-            {
-                for (int x = 0; x < cellCount; x++)
-                {
-                    int flatIdx = x + (y * cellCount) + (z * cellCount * cellCount);
-                    if (flatResults[flatIdx] == 0)
-                    {
-                        var cell = new g4.Vector3i(x, y, z);
-                        bmp[cell] = 0;
-                        activeBlocks.Add(cell);
-                    }
-                }
-            }
-
-            int currentZ = Interlocked.Increment(ref processedZ);
-            if (currentZ % 10 == 0)
-            {
-                progress?.Report((0.40 + (0.30 * ((double)currentZ / cellCount)), "Grid Reconstruction..."));
-            }
-        });
-
-        var blueprint = new BlueprintMesh();
-        blueprint.Blocks = bmp;
-        blueprint.Coords = indexer;
-        blueprint.Shapes = settings.BlockSize switch
-        {
-            BlockSizes.TwoPointFive => ShapeDB.LargeShapes,
-            BlockSizes.HalfMeter => ShapeDB.MidShapes
-        };
-
-        // PHASE 4: Slope Generation (70% - 100%)
-        progress?.Report((0.70, "Slope Evaluation..."));
-        int totalSlopePasses = (settings.SlopesUpper ? 4 : 0) + (settings.SlopesLower ? 4 : 0) + (settings.SlopesSides ? 4 : 0);
-        int executedPasses = 0;
-
-        if (settings.SlopesUpper) { ExecSlopes(1); ExecSlopes(2); ExecSlopes(3); ExecSlopes(4); }
-        if (settings.SlopesLower) { ExecSlopes(5); ExecSlopes(6); ExecSlopes(7); ExecSlopes(8); }
-        if (settings.SlopesSides) { ExecSlopes(9); ExecSlopes(10); ExecSlopes(11); ExecSlopes(12); }
-
-        void ExecSlopes(int content)
-        {
-            var shapeInfo = blueprint.Shapes[content];
-            var probeDirectionA = -Base6Directions.Vectors[shapeInfo.Forward];
-            var probeDirectionB = Base6Directions.Vectors[shapeInfo.Up];
-            var supportDirectionA = -probeDirectionA;
-            var supportDirectionB = -probeDirectionB;
-
-            // Multithreaded Slope Evaluation strictly over filled blocks
-            System.Threading.Tasks.Parallel.ForEach(activeBlocks, new System.Threading.Tasks.ParallelOptions { CancellationToken = ct }, g =>
-            {
-                if (blueprint[g] != 0) return; // 'return' breaks out of the lambda for this specific block
-
-                if (blueprint[g + probeDirectionA] != BlueprintMesh.NoContent || blueprint[g + probeDirectionB] != BlueprintMesh.NoContent)
-                {
-                    return;
-                }
-
-                if (settings.SlopesMustBeSupported)
-                {
-                    if (blueprint[g + supportDirectionA] != 0 || blueprint[g + supportDirectionB] != 0)
-                    {
-                        return;
-                    }
-                }
-
-                bmp[g] = content;
-            });
-
-            if (totalSlopePasses > 0)
-            {
-                int currentPass = System.Threading.Interlocked.Increment(ref executedPasses);
-                progress?.Report((0.70 + (0.30 * ((double)currentPass / totalSlopePasses)), "Slope Evaluation..."));
-            }
-        }
-
-        progress?.Report((1.0, "Complete, finalization!"));
-        return blueprint;
-    }
+        => CoreGenerate(settings, useGpu: true, ct, progress);
 
     public BlueprintMesh GenerateCpu(GeneratorSettings settings, CancellationToken ct, IProgress<(double, string)> progress = null)
+        => CoreGenerate(settings, useGpu: false, ct, progress);
+
+    // --- UNIFIED GENERATOR ---
+    private BlueprintMesh CoreGenerate(GeneratorSettings settings, bool useGpu, CancellationToken ct, IProgress<(double, string)> progress)
     {
+        // ==========================================
+        // PHASE 1: SHARED SETUP & GRID ALLOCATION
+        // ==========================================
         var blockSize = settings.BlockSize switch
         {
             BlockSizes.TwoPointFive => ShapeDB.LargeBlockSize,
             BlockSizes.HalfMeter => ShapeDB.MidBlockSize
         };
 
-        var minimalBounds = this.Tree.Bounds;
-        minimalBounds.Min -= blockSize;
-        minimalBounds.Max += blockSize;
+        var bounds = this.Tree.Bounds;
+        bounds.Expand(blockSize);
 
-        var boundingBox = new AxisAlignedBox3d(new Vector3d(0), blockSize / 2);
-        while (boundingBox.Contains(minimalBounds) == false)
+        int gridX = (int)Math.Ceiling(bounds.Width / blockSize);
+        int gridY = (int)Math.Ceiling(bounds.Height / blockSize);
+        int gridZ = (int)Math.Ceiling(bounds.Depth / blockSize);
+
+        long totalGridVolume = (long)gridX * gridY * gridZ;
+
+        if (totalGridVolume >= 67_108_864)
         {
-            boundingBox.Scale(2, 2, 2);
+            throw new Exception($"Model is too large for {settings.BlockSize} resolution!\n" +
+                                $"Requires {totalGridVolume:N0} blocks ({gridX}x{gridY}x{gridZ}).\n" +
+                                $"Please scale the model down or select a larger block size.");
+        }
+        if (this.Mesh.TriangleCount == 0)
+        {
+            throw new Exception("The selected model contains no 3D geometry.");
         }
 
-        System.Diagnostics.Debug.WriteLine($"\nExecuting the model to blueprint conversion on the CPU\n");
-        var cellCount = (int)Math.Ceiling(boundingBox.MaxDim / blockSize);
-        var indexer = new ShiftGridIndexer3(boundingBox.Min, blockSize);
+        var indexer = new ShiftGridIndexer3(bounds.Min, blockSize);
+        var bmp = new DenseGrid3i(gridX, gridY, gridZ, BlueprintMesh.NoContent);
+        int triangleCount = this.Mesh.TriangleCount;
 
-        var bmp = new DenseGrid3i(cellCount, cellCount, cellCount, BlueprintMesh.NoContent);
-
-        var blueprint = new BlueprintMesh();
-        blueprint.Blocks = bmp;
-        blueprint.Coords = indexer;
-        blueprint.Shapes = settings.BlockSize switch
+        var blueprint = new BlueprintMesh
         {
-            BlockSizes.TwoPointFive => ShapeDB.LargeShapes,
-            BlockSizes.HalfMeter => ShapeDB.MidShapes
+            Blocks = bmp,
+            Coords = indexer,
+            Shapes = settings.BlockSize switch
+            {
+                BlockSizes.TwoPointFive => ShapeDB.LargeShapes,
+                BlockSizes.HalfMeter => ShapeDB.MidShapes
+            }
         };
 
-        int triangleCount = this.Mesh.TriangleCount;
-        int tIndex = 0;
+        IEnumerable<Vector3i> activeBlocks;
 
-        foreach (var triangle in this.Mesh.EnumerateTriangles())
+        // ==========================================
+        // PHASE 2: VOXELIZATION (BRANCHING)
+        // ==========================================
+        if (useGpu)
         {
-            ct.ThrowIfCancellationRequested();
-            if (tIndex % 1000 == 0) progress?.Report((0.7 * ((double)tIndex / triangleCount), "Triangle Evaluation..."));
-            tIndex++;
+            Accelerator accelerator;
+            Action<Index1D, ArrayView<GpuTriangle>, ArrayView<int>, Float3, float, int, int, int> voxelizeKernel;
+            Action<Index1D, ArrayView<int>, int> initGridKernel;
 
-            var triBox = triangle.ToBox();
-            foreach (var cell in Enumerators.BoxRange(triBox, indexer))
+            lock (GpuSetup.SyncLock)
             {
-                var cellBox = indexer.ToBox(cell);
-                if (cellBox.IntersectWithTriangle(triangle) != IntersectResult.NoIntersection)
+                accelerator = GpuSetup.Accelerator;
+                voxelizeKernel = GpuSetup.VoxelizeKernel;
+                initGridKernel = GpuSetup.InitGridKernel;
+            }
+
+            System.Diagnostics.Debug.WriteLine($"\n[ILGPU VERIFICATION] Executing on: {accelerator.Name} (Type: {accelerator.AcceleratorType})\n");
+
+            var flatTriangles = new GpuTriangle[triangleCount];
+            int tIndex = 0;
+
+            foreach (var triangle in this.Mesh.EnumerateTriangles())
+            {
+                ct.ThrowIfCancellationRequested();
+                if (tIndex % 5000 == 0) progress?.Report((0.1 * ((double)tIndex / triangleCount), "Mesh Flattening..."));
+
+                var box = triangle.ToBox();
+                flatTriangles[tIndex++] = new GpuTriangle
                 {
-                    bmp[cell] = 0; //Cube
+                    V0 = new Float3((float)triangle.V0.x, (float)triangle.V0.y, (float)triangle.V0.z),
+                    V1 = new Float3((float)triangle.V1.x, (float)triangle.V1.y, (float)triangle.V1.z),
+                    V2 = new Float3((float)triangle.V2.x, (float)triangle.V2.y, (float)triangle.V2.z),
+                    MinBounds = new Float3((float)box.Min.x, (float)box.Min.y, (float)box.Min.z),
+                    MaxBounds = new Float3((float)box.Max.x, (float)box.Max.y, (float)box.Max.z)
+                };
+            }
+
+            int[] flatResults;
+            int totalCells = (int)totalGridVolume;
+
+            try
+            {
+                using var deviceTriangles = accelerator.Allocate1D(flatTriangles);
+                using var deviceGrid = accelerator.Allocate1D<int>(totalCells);
+
+                initGridKernel(totalCells, deviceGrid.View, BlueprintMesh.NoContent);
+
+                Float3 origin = new Float3((float)bounds.Min.x, (float)bounds.Min.y, (float)bounds.Min.z);
+
+                voxelizeKernel(deviceTriangles.IntExtent, deviceTriangles.View, deviceGrid.View, origin, blockSize, gridX, gridY, gridZ);
+
+                accelerator.Synchronize();
+                progress?.Report((0.40, "Voxelization..."));
+                flatResults = deviceGrid.GetAsArray1D();
+            }
+            catch (Exception ex)
+            {
+                throw new Exception("The GPU driver failed during allocation. Out of VRAM or driver error.", ex);
+            }
+
+            _ = Task.Run(() => GpuSetup.RebuildContext());
+
+            int processedZ = 0;
+            var gpuActiveBlocks = new System.Collections.Concurrent.ConcurrentBag<Vector3i>();
+
+            Parallel.For(0, gridZ, new ParallelOptions { CancellationToken = ct }, z =>
+            {
+                for (int y = 0; y < gridY; y++)
+                {
+                    for (int x = 0; x < gridX; x++)
+                    {
+                        int flatIdx = x + (y * gridX) + (z * gridX * gridY);
+                        if (flatResults[flatIdx] == 0)
+                        {
+                            var cell = new Vector3i(x, y, z);
+                            bmp[cell] = 0;
+                            gpuActiveBlocks.Add(cell);
+                        }
+                    }
+                }
+
+                int currentZ = Interlocked.Increment(ref processedZ);
+                if (currentZ % 10 == 0)
+                {
+                    progress?.Report((0.40 + (0.30 * ((double)currentZ / gridZ)), "Grid Reconstruction..."));
+                }
+            });
+
+            activeBlocks = gpuActiveBlocks;
+        }
+        else
+        {
+            System.Diagnostics.Debug.WriteLine($"\nExecuting the model to blueprint conversion on the CPU\n");
+            int tIndex = 0;
+
+            foreach (var triangle in this.Mesh.EnumerateTriangles())
+            {
+                ct.ThrowIfCancellationRequested();
+                if (tIndex % 1000 == 0) progress?.Report((0.7 * ((double)tIndex / triangleCount), "Triangle Evaluation..."));
+                tIndex++;
+
+                var triBox = triangle.ToBox();
+                foreach (var cell in Enumerators.BoxRange(triBox, indexer))
+                {
+                    var cellBox = indexer.ToBox(cell);
+                    if (cellBox.IntersectWithTriangle(triangle) != IntersectResult.NoIntersection)
+                    {
+                        bmp[cell] = 0;
+                    }
                 }
             }
-        }
 
-        // OPTIMIZATION: Gather only the active blocks to eliminate millions of empty-space checks
-        var activeBlocks = new List<g4.Vector3i>();
-        foreach (var g in bmp.Indices())
-        {
-            if (bmp[g] == 0)
+            var cpuActiveBlocks = new List<Vector3i>();
+            foreach (var g in bmp.Indices())
             {
-                activeBlocks.Add(g);
+                if (bmp[g] == 0)
+                {
+                    cpuActiveBlocks.Add(g);
+                }
             }
+
+            activeBlocks = cpuActiveBlocks;
         }
 
+        // ==========================================
+        // PHASE 3: SHARED SLOPE GENERATION
+        // ==========================================
         progress?.Report((0.70, "Slope Evaluation..."));
         int totalSlopePasses = (settings.SlopesUpper ? 4 : 0) + (settings.SlopesLower ? 4 : 0) + (settings.SlopesSides ? 4 : 0);
         int executedPasses = 0;
@@ -318,8 +300,7 @@ public class GridShaper
             var supportDirectionA = -probeDirectionA;
             var supportDirectionB = -probeDirectionB;
 
-            // Multithreaded Slope Evaluation strictly over filled blocks
-            System.Threading.Tasks.Parallel.ForEach(activeBlocks, new System.Threading.Tasks.ParallelOptions { CancellationToken = ct }, g =>
+            Parallel.ForEach(activeBlocks, new ParallelOptions { CancellationToken = ct }, g =>
             {
                 if (blueprint[g] != 0) return;
 
@@ -341,12 +322,12 @@ public class GridShaper
 
             if (totalSlopePasses > 0)
             {
-                int currentPass = System.Threading.Interlocked.Increment(ref executedPasses);
+                int currentPass = Interlocked.Increment(ref executedPasses);
                 progress?.Report((0.70 + (0.30 * ((double)currentPass / totalSlopePasses)), "Slope Evaluation..."));
             }
         }
 
-        progress?.Report((1.0, "Complete!"));
+        progress?.Report((1.0, "Complete, finalization!"));
         return blueprint;
     }
 
@@ -393,7 +374,6 @@ public class GridShaper
             var cubesMesh = cubesSurfaceGenerator.Meshes[0];
             MeshTransforms.Scale(cubesMesh, blueprint.Coords.CellSize);
 
-            // Voxel generator generates around UnitZeroCentered, while indexer rounds down to corner
             var correctionOffset = blueprint.Coords.CellSize / 2;
             MeshTransforms.Translate(cubesMesh, blueprint.Coords.Origin + correctionOffset);
 
@@ -548,7 +528,6 @@ public class GridShaper
 
         public void Generate(BlueprintMesh blueprint, StringBuilder sb)
         {
-            //Prefab|PositionX|PositionY|PositionZ|ColorHUE|ColorSATURATION|ColorVALUE|OrientationFORWARD|OrientationUP|Integrity
             var blockGrid = blueprint.Blocks;
             foreach (var g in blockGrid.Indices())
             {
@@ -572,14 +551,12 @@ public class GridShaper
                 var gridPosition = ToInt(cube.Center / ShapeDB.SmallBlockSize);
                 gridPosition += PositionOffset
                 (
-                    //TODO:
                     blueprint.Shapes == ShapeDB.LargeShapes ?
                         new AxisAlignedBox3i(new Vector3i(-4, -4, -4), new Vector3i(5, 5, 5)) :
                         new AxisAlignedBox3i(new Vector3i(0, 0, 0), new Vector3i(1, 1, 1)),
                     forwardAxis,
                     upAxis
                 );
-
 
                 sb.Append(gridPosition.x);
                 sb.Append('|');
@@ -660,6 +637,11 @@ public class GridShaper
         private static int Floor(float val) => val < 0f ? (int)val - 1 : (int)val;
         private static int Ceiling(float val) => val > (int)val ? (int)val + 1 : (int)val;
 
+        public static void InitializeGrid(Index1D index, ArrayView<int> grid, int value)
+        {
+            grid[index] = value;
+        }
+
         public static void Voxelize(
             Index1D index,
             ArrayView<GpuTriangle> triangles,
@@ -680,7 +662,6 @@ public class GridShaper
             int maxY = Min(gridY - 1, Ceiling((tri.MaxBounds.Y - gridOrigin.Y) / cellSize));
             int maxZ = Min(gridZ - 1, Ceiling((tri.MaxBounds.Z - gridOrigin.Z) / cellSize));
 
-            // OPTIMIZATION 1: Precompute triangle edges and normal outside the loop
             float e0X = tri.V1.X - tri.V0.X; float e0Y = tri.V1.Y - tri.V0.Y; float e0Z = tri.V1.Z - tri.V0.Z;
             float e1X = tri.V2.X - tri.V1.X; float e1Y = tri.V2.Y - tri.V1.Y; float e1Z = tri.V2.Z - tri.V1.Z;
             float e2X = tri.V0.X - tri.V2.X; float e2Y = tri.V0.Y - tri.V2.Y; float e2Z = tri.V0.Z - tri.V2.Z;
@@ -701,13 +682,11 @@ public class GridShaper
                             gridOrigin.Z + (z + 0.5f) * cellSize
                         );
 
-                        // Pass precomputed values into the intersection test
                         if (CheckTriangleBoxIntersection(tri, cellCenter, cellSize,
                             e0X, e0Y, e0Z, e1X, e1Y, e1Z, e2X, e2Y, e2Z, normalX, normalY, normalZ))
                         {
                             int flatIndex = x + (y * gridX) + (z * gridX * gridY);
 
-                            // OPTIMIZATION 2: Cache-friendly early exit prevents memory bus locking
                             if (voxelGrid[flatIndex] != 0)
                             {
                                 Atomic.Exchange(ref voxelGrid[flatIndex], 0);
@@ -727,17 +706,14 @@ public class GridShaper
         {
             float boxHalf = cellSize * 0.5f;
 
-            // Shift triangle to local AABB coordinate space
             float v0X = tri.V0.X - boxCenter.X; float v0Y = tri.V0.Y - boxCenter.Y; float v0Z = tri.V0.Z - boxCenter.Z;
             float v1X = tri.V1.X - boxCenter.X; float v1Y = tri.V1.Y - boxCenter.Y; float v1Z = tri.V1.Z - boxCenter.Z;
             float v2X = tri.V2.X - boxCenter.X; float v2Y = tri.V2.Y - boxCenter.Y; float v2Z = tri.V2.Z - boxCenter.Z;
 
-            // SAT Test 1: Box AABB bounds
             if (Min3(v0X, v1X, v2X) > boxHalf || Max3(v0X, v1X, v2X) < -boxHalf) return false;
             if (Min3(v0Y, v1Y, v2Y) > boxHalf || Max3(v0Y, v1Y, v2Y) < -boxHalf) return false;
             if (Min3(v0Z, v1Z, v2Z) > boxHalf || Max3(v0Z, v1Z, v2Z) < -boxHalf) return false;
 
-            // SAT Test 2: Triangle Plane vs Box Overlap
             float d = -(normalX * v0X + normalY * v0Y + normalZ * v0Z);
 
             float vminX = normalX > 0f ? -boxHalf : boxHalf; float vmaxX = normalX > 0f ? boxHalf : -boxHalf;
@@ -747,7 +723,6 @@ public class GridShaper
             if ((normalX * vminX + normalY * vminY + normalZ * vminZ) + d > 0f) return false;
             if ((normalX * vmaxX + normalY * vmaxY + normalZ * vmaxZ) + d < 0f) return false;
 
-            // SAT Test 3: Edge Cross Products
             if (!AxisTest(e0Z, -e0Y, v0Y, v0Z, v2Y, v2Z, boxHalf)) return false;
             if (!AxisTest(e1Z, -e1Y, v1Y, v1Z, v0Y, v0Z, boxHalf)) return false;
             if (!AxisTest(e2Z, -e2Y, v2Y, v2Z, v1Y, v1Z, boxHalf)) return false;
