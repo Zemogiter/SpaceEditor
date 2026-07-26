@@ -300,7 +300,10 @@ public partial class BlueprintGenerator : UserControl
             {
                 // Guarantee the UI resets and the generate button is visible even if generation fails or is cancelled
                 this.GenerateButton.Visibility = Visibility.Visible;
-                this.GenerateProgress.Visibility = Visibility.Collapsed;
+
+                // Explicitly collapse the entire overlay grid, NOT just the inner progress bar
+                this.ProgressOverlay.Visibility = Visibility.Collapsed;
+
                 // Explicitly hide and clear the text block
                 this.ProgressText.Visibility = Visibility.Collapsed;
                 this.ProgressText.Text = string.Empty;
