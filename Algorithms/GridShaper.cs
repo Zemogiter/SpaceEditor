@@ -4,6 +4,7 @@ using ILGPU.Runtime;
 using PropertyTools.DataAnnotations;
 using SpaceEditor.Rocks;
 using System.IO;
+using System.Runtime;
 using System.Text;
 
 namespace SpaceEditor.Algorithms;
@@ -25,6 +26,18 @@ public struct GpuTriangle
     public Float3 MaxBounds;
 }
 
+// Struct to bypass the C# 16-parameter limit for delegates
+public struct GpuSlopeParams
+{
+    public int GridX, GridY, GridZ;
+    public int PAx, PAy, PAz;
+    public int PBx, PBy, PBz;
+    public int SAx, SAy, SAz;
+    public int SBx, SBy, SBz;
+    public int Content;
+    public int MustBeSupported;
+}
+
 public class GridShaper
 {
     public DMesh3 Mesh { get; }
@@ -43,6 +56,7 @@ public class GridShaper
         public static Accelerator Accelerator { get; private set; }
         public static Action<Index1D, ArrayView<GpuTriangle>, ArrayView<int>, Float3, float, int, int, int> VoxelizeKernel { get; private set; }
         public static Action<Index1D, ArrayView<int>, int> InitGridKernel { get; private set; }
+        public static Action<Index1D, ArrayView<int>, GpuSlopeParams> SlopeKernel { get; private set; }
 
         public static readonly object SyncLock = new object();
 
@@ -70,6 +84,10 @@ public class GridShaper
                 InitGridKernel = Accelerator.LoadAutoGroupedStreamKernel<
                     Index1D, ArrayView<int>, int>(
                     VoxelizationKernel.InitializeGrid);
+
+                SlopeKernel = Accelerator.LoadAutoGroupedStreamKernel<
+                    Index1D, ArrayView<int>, GpuSlopeParams>(
+                    VoxelizationKernel.GenerateSlopes);
             }
         }
     }
@@ -107,6 +125,7 @@ public class GridShaper
 
     public BlueprintMesh GenerateCpu(GeneratorSettings settings, CancellationToken ct, IProgress<(double, string)> progress = null)
         => CoreGenerate(settings, useGpu: false, ct, progress);
+
 
     // --- UNIFIED GENERATOR ---
     private BlueprintMesh CoreGenerate(GeneratorSettings settings, bool useGpu, CancellationToken ct, IProgress<(double, string)> progress)
@@ -147,19 +166,21 @@ public class GridShaper
         IEnumerable<Vector3i> activeBlocks;
 
         // ==========================================
-        // PHASE 2: VOXELIZATION (BRANCHING)
+        // PHASE 2 & 3: GPU VOXELIZATION & SLOPE GENERATION
         // ==========================================
         if (useGpu)
         {
             Accelerator accelerator;
             Action<Index1D, ArrayView<GpuTriangle>, ArrayView<int>, Float3, float, int, int, int> voxelizeKernel;
             Action<Index1D, ArrayView<int>, int> initGridKernel;
+            Action<Index1D, ArrayView<int>, GpuSlopeParams> slopeKernel;
 
             lock (GpuSetup.SyncLock)
             {
                 accelerator = GpuSetup.Accelerator;
                 voxelizeKernel = GpuSetup.VoxelizeKernel;
                 initGridKernel = GpuSetup.InitGridKernel;
+                slopeKernel = GpuSetup.SlopeKernel;
             }
 
             System.Diagnostics.Debug.WriteLine($"\n[ILGPU VERIFICATION] Executing on: {accelerator.Name} (Type: {accelerator.AcceleratorType})\n");
@@ -183,7 +204,6 @@ public class GridShaper
                 };
             }
 
-            int[] flatResults;
             int totalCells = (int)totalGridVolume;
 
             try
@@ -196,45 +216,90 @@ public class GridShaper
                 Float3 origin = new Float3((float)bounds.Min.x, (float)bounds.Min.y, (float)bounds.Min.z);
 
                 voxelizeKernel(deviceTriangles.IntExtent, deviceTriangles.View, deviceGrid.View, origin, blockSize, gridX, gridY, gridZ);
-
                 accelerator.Synchronize();
-                progress?.Report((0.40, "Voxelization..."));
-                flatResults = deviceGrid.GetAsArray1D();
-            }
-            catch (Exception ex)
-            {
-                throw new Exception("The GPU driver failed during allocation. Out of VRAM or driver error.", ex);
-            }
+                progress?.Report((0.40, "Voxelization complete on GPU..."));
 
-            _ = Task.Run(() => GpuSetup.RebuildContext());
+                int totalSlopePasses = (settings.SlopesUpper ? 4 : 0) + (settings.SlopesLower ? 4 : 0) + (settings.SlopesSides ? 4 : 0);
+                int executedPasses = 0;
 
-            int processedZ = 0;
-            var gpuActiveBlocks = new System.Collections.Concurrent.ConcurrentBag<Vector3i>();
-
-            Parallel.For(0, gridZ, new ParallelOptions { CancellationToken = ct }, z =>
-            {
-                for (int y = 0; y < gridY; y++)
+                void ExecGpuSlopes(int content)
                 {
-                    for (int x = 0; x < gridX; x++)
+                    var shapeInfo = blueprint.Shapes[content];
+                    var probeDirectionA = -Base6Directions.Vectors[shapeInfo.Forward];
+                    var probeDirectionB = Base6Directions.Vectors[shapeInfo.Up];
+                    var supportDirectionA = -probeDirectionA;
+                    var supportDirectionB = -probeDirectionB;
+
+                    var slopeParams = new GpuSlopeParams
                     {
-                        int flatIdx = x + (y * gridX) + (z * gridX * gridY);
-                        if (flatResults[flatIdx] == 0)
-                        {
-                            var cell = new Vector3i(x, y, z);
-                            bmp[cell] = 0;
-                            gpuActiveBlocks.Add(cell);
-                        }
+                        GridX = gridX,
+                        GridY = gridY,
+                        GridZ = gridZ,
+                        PAx = probeDirectionA.x,
+                        PAy = probeDirectionA.y,
+                        PAz = probeDirectionA.z,
+                        PBx = probeDirectionB.x,
+                        PBy = probeDirectionB.y,
+                        PBz = probeDirectionB.z,
+                        SAx = supportDirectionA.x,
+                        SAy = supportDirectionA.y,
+                        SAz = supportDirectionA.z,
+                        SBx = supportDirectionB.x,
+                        SBy = supportDirectionB.y,
+                        SBz = supportDirectionB.z,
+                        Content = content,
+                        MustBeSupported = settings.SlopesMustBeSupported ? 1 : 0
+                    };
+
+                    slopeKernel(totalCells, deviceGrid.View, slopeParams);
+                    accelerator.Synchronize();
+
+                    if (totalSlopePasses > 0)
+                    {
+                        int currentPass = Interlocked.Increment(ref executedPasses);
+                        progress?.Report((0.40 + (0.30 * ((double)currentPass / totalSlopePasses)), "GPU Slope Evaluation..."));
                     }
                 }
 
-                int currentZ = Interlocked.Increment(ref processedZ);
-                if (currentZ % 10 == 0)
-                {
-                    progress?.Report((0.40 + (0.30 * ((double)currentZ / gridZ)), "Grid Reconstruction..."));
-                }
-            });
+                if (settings.SlopesUpper) { ExecGpuSlopes(1); ExecGpuSlopes(2); ExecGpuSlopes(3); ExecGpuSlopes(4); }
+                if (settings.SlopesLower) { ExecGpuSlopes(5); ExecGpuSlopes(6); ExecGpuSlopes(7); ExecGpuSlopes(8); }
+                if (settings.SlopesSides) { ExecGpuSlopes(9); ExecGpuSlopes(10); ExecGpuSlopes(11); ExecGpuSlopes(12); }
 
-            activeBlocks = gpuActiveBlocks;
+                int[] flatResults = deviceGrid.GetAsArray1D();
+                _ = Task.Run(() => GpuSetup.RebuildContext());
+
+                int processedZ = 0;
+                var gpuActiveBlocks = new System.Collections.Concurrent.ConcurrentBag<Vector3i>();
+
+                Parallel.For(0, gridZ, new ParallelOptions { CancellationToken = ct }, z =>
+                {
+                    for (int y = 0; y < gridY; y++)
+                    {
+                        for (int x = 0; x < gridX; x++)
+                        {
+                            int flatIdx = x + (y * gridX) + (z * gridX * gridY);
+                            if (flatResults[flatIdx] != BlueprintMesh.NoContent)
+                            {
+                                var cell = new Vector3i(x, y, z);
+                                bmp[cell] = flatResults[flatIdx];
+                                gpuActiveBlocks.Add(cell);
+                            }
+                        }
+                    }
+
+                    int currentZ = Interlocked.Increment(ref processedZ);
+                    if (currentZ % 10 == 0)
+                    {
+                        progress?.Report((0.70 + (0.30 * ((double)currentZ / gridZ)), "Grid Reconstruction..."));
+                    }
+                });
+
+                activeBlocks = gpuActiveBlocks;
+            }
+            catch (Exception ex)
+            {
+                throw new Exception("The GPU driver failed during allocation or kernel execution. Out of VRAM or driver error.", ex);
+            }
         }
         else
         {
@@ -268,58 +333,64 @@ public class GridShaper
             }
 
             activeBlocks = cpuActiveBlocks;
-        }
 
-        // ==========================================
-        // PHASE 3: SHARED SLOPE GENERATION
-        // ==========================================
-        progress?.Report((0.70, "Slope Evaluation..."));
-        int totalSlopePasses = (settings.SlopesUpper ? 4 : 0) + (settings.SlopesLower ? 4 : 0) + (settings.SlopesSides ? 4 : 0);
-        int executedPasses = 0;
+            progress?.Report((0.70, "Slope Evaluation..."));
+            int totalSlopePasses = (settings.SlopesUpper ? 4 : 0) + (settings.SlopesLower ? 4 : 0) + (settings.SlopesSides ? 4 : 0);
+            int executedPasses = 0;
 
-        if (settings.SlopesUpper) { ExecSlopes(1); ExecSlopes(2); ExecSlopes(3); ExecSlopes(4); }
-        if (settings.SlopesLower) { ExecSlopes(5); ExecSlopes(6); ExecSlopes(7); ExecSlopes(8); }
-        if (settings.SlopesSides) { ExecSlopes(9); ExecSlopes(10); ExecSlopes(11); ExecSlopes(12); }
+            if (settings.SlopesUpper) { ExecCpuSlopes(1); ExecCpuSlopes(2); ExecCpuSlopes(3); ExecCpuSlopes(4); }
+            if (settings.SlopesLower) { ExecCpuSlopes(5); ExecCpuSlopes(6); ExecCpuSlopes(7); ExecCpuSlopes(8); }
+            if (settings.SlopesSides) { ExecCpuSlopes(9); ExecCpuSlopes(10); ExecCpuSlopes(11); ExecCpuSlopes(12); }
 
-        void ExecSlopes(int content)
-        {
-            var shapeInfo = blueprint.Shapes[content];
-            var probeDirectionA = -Base6Directions.Vectors[shapeInfo.Forward];
-            var probeDirectionB = Base6Directions.Vectors[shapeInfo.Up];
-            var supportDirectionA = -probeDirectionA;
-            var supportDirectionB = -probeDirectionB;
-
-            Parallel.ForEach(activeBlocks, new ParallelOptions { CancellationToken = ct }, g =>
+            void ExecCpuSlopes(int content)
             {
-                if (blueprint[g] != 0) return;
+                var shapeInfo = blueprint.Shapes[content];
+                var probeDirectionA = -Base6Directions.Vectors[shapeInfo.Forward];
+                var probeDirectionB = Base6Directions.Vectors[shapeInfo.Up];
+                var supportDirectionA = -probeDirectionA;
+                var supportDirectionB = -probeDirectionB;
 
-                if (blueprint[g + probeDirectionA] != BlueprintMesh.NoContent || blueprint[g + probeDirectionB] != BlueprintMesh.NoContent)
+                Parallel.ForEach(activeBlocks, new ParallelOptions { CancellationToken = ct }, g =>
                 {
-                    return;
-                }
+                    if (blueprint[g] != 0) return;
 
-                if (settings.SlopesMustBeSupported)
-                {
-                    if (blueprint[g + supportDirectionA] != 0 || blueprint[g + supportDirectionB] != 0)
+                    if (blueprint[g + probeDirectionA] != BlueprintMesh.NoContent || blueprint[g + probeDirectionB] != BlueprintMesh.NoContent)
                     {
                         return;
                     }
+
+                    if (settings.SlopesMustBeSupported)
+                    {
+                        if (blueprint[g + supportDirectionA] != 0 || blueprint[g + supportDirectionB] != 0)
+                        {
+                            return;
+                        }
+                    }
+
+                    bmp[g] = content;
+                });
+
+                if (totalSlopePasses > 0)
+                {
+                    int currentPass = Interlocked.Increment(ref executedPasses);
+                    progress?.Report((0.70 + (0.30 * ((double)currentPass / totalSlopePasses)), "Slope Evaluation..."));
                 }
-
-                bmp[g] = content;
-            });
-
-            if (totalSlopePasses > 0)
-            {
-                int currentPass = Interlocked.Increment(ref executedPasses);
-                progress?.Report((0.70 + (0.30 * ((double)currentPass / totalSlopePasses)), "Slope Evaluation..."));
             }
         }
+
+        // Forcing the .NET runtime to compact the LOH and free up memory after the voxelization and slope generation, watch this space in case it hurts performance
+        GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce;
+        GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
 
         progress?.Report((1.0, "Complete, finalization!"));
         return blueprint;
     }
 
+
+    // ==========================================
+    // PHASE 4: CPU MESHING & FINALIZATION 
+    // (Handles VoxelSurfaceGenerator, Marching Cubes, and Text Export)
+    // ==========================================
     public class GridMesher
     {
         public static DMesh3 Mesh(BlueprintMesh blueprint)
@@ -366,7 +437,6 @@ public class GridShaper
             var correctionOffset = blueprint.Coords.CellSize / 2;
             MeshTransforms.Translate(cubesMesh, blueprint.Coords.Origin + correctionOffset);
 
-
             var finalMesh = cubesMesh;
             finalMesh.AppendMesh(slopeMesh);
 
@@ -399,10 +469,8 @@ public class GridShaper
 
         public static ShapeDB LargeShapes = new
         (
-            // Cube
             CubicShape("2eacbbf2-d8fb-4a78-91dc-7b492517ef97", x => x.AppendBox(Dims(LargeBlockSize))),
 
-            // Slopes
             SlopeShape("f9efcc6c-6c76-4762-bbf0-6013ec969539", LargeBlockSize, Base6Directions.Left, Base6Directions.Up),
             SlopeShape("f9efcc6c-6c76-4762-bbf0-6013ec969539", LargeBlockSize, Base6Directions.Right, Base6Directions.Up),
             SlopeShape("f9efcc6c-6c76-4762-bbf0-6013ec969539", LargeBlockSize, Base6Directions.Forward, Base6Directions.Up),
@@ -421,10 +489,8 @@ public class GridShaper
 
         public static ShapeDB MidShapes = new
         (
-            // Cube
             CubicShape("632d7385-12b9-47a6-802a-a610d0cbd1e0", x => x.AppendBox(Dims(MidBlockSize))),
 
-            // Slopes
             SlopeShape("69902790-3e2d-43d2-81e4-1c0b42bc7461", MidBlockSize, Base6Directions.Left, Base6Directions.Up),
             SlopeShape("69902790-3e2d-43d2-81e4-1c0b42bc7461", MidBlockSize, Base6Directions.Right, Base6Directions.Up),
             SlopeShape("69902790-3e2d-43d2-81e4-1c0b42bc7461", MidBlockSize, Base6Directions.Forward, Base6Directions.Up),
@@ -615,7 +681,6 @@ public class GridShaper
 
     public static class VoxelizationKernel
     {
-        // GPU-safe math implementations
         private static int Min(int a, int b) => a < b ? a : b;
         private static int Max(int a, int b) => a > b ? a : b;
         private static float Min(float a, float b) => a < b ? a : b;
@@ -684,6 +749,47 @@ public class GridShaper
                     }
                 }
             }
+        }
+
+        public static void GenerateSlopes(
+            Index1D index,
+            ArrayView<int> voxelGrid,
+            GpuSlopeParams p)
+        {
+            int x = index % p.GridX;
+            int y = (index / p.GridX) % p.GridY;
+            int z = index / (p.GridX * p.GridY);
+
+            if (voxelGrid[index] != 0) return;
+
+            int nxA = x + p.PAx; int nyA = y + p.PAy; int nzA = z + p.PAz;
+            int nxB = x + p.PBx; int nyB = y + p.PBy; int nzB = z + p.PBz;
+
+            if (nxA < 0 || nxA >= p.GridX || nyA < 0 || nyA >= p.GridY || nzA < 0 || nzA >= p.GridZ) return;
+            if (nxB < 0 || nxB >= p.GridX || nyB < 0 || nyB >= p.GridY || nzB < 0 || nzB >= p.GridZ) return;
+
+            int idxA = nxA + (nyA * p.GridX) + (nzA * p.GridX * p.GridY);
+            int idxB = nxB + (nyB * p.GridX) + (nzB * p.GridX * p.GridY);
+
+            if (voxelGrid[idxA] != int.MaxValue || voxelGrid[idxB] != int.MaxValue)
+                return;
+
+            if (p.MustBeSupported == 1)
+            {
+                int sxA = x + p.SAx; int syA = y + p.SAy; int szA = z + p.SAz;
+                int sxB = x + p.SBx; int syB = y + p.SBy; int szB = z + p.SBz;
+
+                if (sxA < 0 || sxA >= p.GridX || syA < 0 || syA >= p.GridY || szA < 0 || szA >= p.GridZ) return;
+                if (sxB < 0 || sxB >= p.GridX || syB < 0 || syB >= p.GridY || szB < 0 || szB >= p.GridZ) return;
+
+                int sIdxA = sxA + (syA * p.GridX) + (szA * p.GridX * p.GridY);
+                int sIdxB = sxB + (syB * p.GridX) + (szB * p.GridX * p.GridY);
+
+                if (voxelGrid[sIdxA] != 0 || voxelGrid[sIdxB] != 0)
+                    return;
+            }
+
+            Atomic.Exchange(ref voxelGrid[index], p.Content);
         }
 
         private static bool CheckTriangleBoxIntersection(

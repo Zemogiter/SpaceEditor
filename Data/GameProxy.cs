@@ -119,7 +119,6 @@ public class GameProxy
         var md = st.AsDynamicType().GetInstance(mdt);
         md.PushContext(new[] { se2 });
 
-        // CACHE TYPES ONCE AT STARTUP
         _customSerializationContextType = FindType("CustomSerializationContext");
         _serializationContextType = FindType("SerializationContext");
         _serializationHelperType = FindType("SerializationHelper");
@@ -144,7 +143,6 @@ public class GameProxy
 
     public dynamic DeserializeObject(Stream content, params object[] services)
     {
-        // Use pre-cached types instead of FindType() and Enum.Parse()
         var typedServices = Array.CreateInstance(_customSerializationContextType, services.Length);
         Array.Copy(services, typedServices, services.Length);
 
@@ -154,14 +152,12 @@ public class GameProxy
 
     public string SerializeObject(object instance, params object[] services)
     {
-        // Use pre-cached types
         var typedServices = Array.CreateInstance(_customSerializationContextType, services.Length);
         Array.Copy(services, typedServices, services.Length);
 
         using var data = new MemoryStream();
         using var sc = (IDisposable)Activator.CreateInstance(_serializationContextType, data, "NoName.txt", typedServices)!;
 
-        // Use pre-cached MethodInfo
         _serializeAbstractMethod.Invoke(null, [sc, instance, _jsonFormatEnumValue]);
 
         return Encoding.UTF8.GetString(data.GetBuffer().AsSpan()[..(int)data.Length]);
@@ -176,19 +172,12 @@ public class GameProxy
         object syncObj = new object();
 
         // 1. FILTER: Only process actual data files to stop blind SerializationExceptions
-        var validFiles = Directory.EnumerateFiles(actionsDir)
-            .Where(f => f.EndsWith(".sbc", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".json", StringComparison.OrdinalIgnoreCase));
+        var validFiles = Directory.EnumerateFiles(actionsDir).Where(f => f.EndsWith(".def", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".json", StringComparison.OrdinalIgnoreCase));
 
         Parallel.ForEach(validFiles, file =>
         {
             try
             {
-                // 2. FAST PATH: If the file doesn't contain a Guid, it's not an input action. 
-                // Skip it instantly to prevent VRage SerializationExceptions and RuntimeBinderExceptions.
-                string contentPreview = File.ReadAllText(file);
-                if (!contentPreview.Contains("Guid") && !contentPreview.Contains("guid"))
-                    return;
-
                 var def = DeserializeFile(file);
                 if (def == null) return;
 
