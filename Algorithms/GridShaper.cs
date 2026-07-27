@@ -129,17 +129,6 @@ public class GridShaper
 
         long totalGridVolume = (long)gridX * gridY * gridZ;
 
-        if (totalGridVolume >= 67_108_864)
-        {
-            throw new Exception($"Model is too large for {settings.BlockSize} resolution!\n" +
-                                $"Requires {totalGridVolume:N0} blocks ({gridX}x{gridY}x{gridZ}).\n" +
-                                $"Please scale the model down or select a larger block size.");
-        }
-        if (this.Mesh.TriangleCount == 0)
-        {
-            throw new Exception("The selected model contains no 3D geometry.");
-        }
-
         var indexer = new ShiftGridIndexer3(bounds.Min, blockSize);
         var bmp = new DenseGrid3i(gridX, gridY, gridZ, BlueprintMesh.NoContent);
         int triangleCount = this.Mesh.TriangleCount;
