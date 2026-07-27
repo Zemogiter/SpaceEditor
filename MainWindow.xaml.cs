@@ -1,5 +1,8 @@
-﻿using System;
-using System.Collections;
+﻿using Microsoft.Win32;
+using SpaceEditor.Controls;
+using SpaceEditor.Data;
+using SpaceEditor.Data.GameLinks;
+using SpaceEditor.Services;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
@@ -7,18 +10,13 @@ using System.Text;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Navigation;
-using Microsoft.Win32;
-using SpaceEditor.Controls;
-using SpaceEditor.Data;
-using SpaceEditor.Data.GameLinks;
-using SpaceEditor.Services;
 
 namespace SpaceEditor;
 
 public partial class MainWindow : Window, INotifyPropertyChanged
 {
     public event PropertyChangedEventHandler? PropertyChanged;
-    
+
     private Settings Settings => Settings.Default;
     private GameLink? GameLink;
 
@@ -124,10 +122,16 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 Content = new BlueprintGenerator()
             });
 
+            tabs.Add(new TabItem
+            {
+                Header = "Blueprint Analyzer",
+                Content = new BlueprintAnalyzerControl { Proxy = game }
+            });
+
             var sb = new StringBuilder();
             sb.AppendLine("Loading finished");
             sb.AppendLine();
-            
+
             sb.AppendLine("Main Assembly:");
             var gameExe = game.MainAssembly;
             sb.AppendLine($"{gameExe.GetName().Name}");
@@ -136,7 +140,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
             sb.AppendLine();
             sb.AppendLine("Use Tabs above to access individual features");
-            
+
             this.InfoText.Text = sb.ToString();
         }
         catch (Exception ex)

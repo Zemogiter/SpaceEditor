@@ -1,7 +1,4 @@
-﻿using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
+﻿using System.IO;
 
 namespace SpaceEditor.Data;
 
@@ -85,17 +82,22 @@ public static class GameFacts
             var testDir = Path.Combine(baseDirectory, currentDirToSearchFor);
             if (Directory.Exists(testDir))
             {
-                if (TryFindTargetPath(testDir, subDirectories[1..], targetFile, remainingSearchDepth) is {} result)
+                if (TryFindTargetPath(testDir, subDirectories[1..], targetFile, remainingSearchDepth) is { } result)
                     return result;
             }
         }
 
         foreach (var dir in Directory.EnumerateDirectories(baseDirectory))
         {
-            if (TryFindTargetPath(dir, subDirectories, targetFile, remainingSearchDepth) is {} result)
+            if (TryFindTargetPath(dir, subDirectories, targetFile, remainingSearchDepth) is { } result)
                 return result;
         }
 
         return null;
+    }
+    public static string GetDefinitionsPath(string baseGamePath)
+    {
+        // VRAGE3 definitions are stored directly in the Vanilla Content folder
+        return GetContentPath(baseGamePath);
     }
 }
